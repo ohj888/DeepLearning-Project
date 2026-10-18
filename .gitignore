@@ -2,3 +2,8 @@ datasets/
 *.tar
 *.tar.gz
 *.zip
+
+models/
+baseline measurments/
+baseline feature cache/
+/models/source/siglip2/

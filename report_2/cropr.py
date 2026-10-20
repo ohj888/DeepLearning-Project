@@ -1,12 +1,14 @@
-"""Local model loading, task heads and Cropr-style pruning for Report 2.
+"""Cropr-style token pruning for the Report 2 BaselineModel interface.
 
-Use build_cropr_model, or wrap an existing model with CroprModel. Train with main task loss
+Wrap an already constructed model with CroprModel. Train with main task loss
 PLUS wrapper.auxiliary_loss(target); hard top-k alone cannot train the scorer.
 This is a block-level adapter, not an attention mask or pretrained pruner.
 See CROPR.md for usage, supported architectures and limitations.
 """
 import os
 from pathlib import Path
+import types
+import hashlib
 from contextlib import ExitStack
 import math
 
@@ -51,14 +53,20 @@ class Cropr(nn.Module):
             raise ValueError("Positive dimensions required; heads must divide embed_dim")
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.queries = nn.Parameter(torch.empty(1, num_queries, embed_dim))
+        # nn.parameter makes this a learnable parameter
+        # cls uses one query
+        # seg uses one query per original patch grid position
+        self.queries = nn.Parameter(torch.empty(1, num_queries, embed_dim))  
         nn.init.trunc_normal_(self.queries, std=embed_dim ** -0.5)
         self.proj = nn.Linear(embed_dim, embed_dim) if num_heads > 1 else nn.Identity()
         self.mlp_norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        # nn.sequential is just linear layer 1, gelu, LL2
         self.mlp = nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(),
                                  nn.Linear(4 * embed_dim, embed_dim))
+        # layer norm normalizes feature values within each token vector.  normalized = (x-mean) / sqrt(var + epsilon) ---- out = learned_scale * normalized + learned_bias
         self.head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, num_classes))
-
+    
+    #forward takes the vit attn block output sequence as input using a
     def forward(self, x, *, auxiliary=False):
         if not auxiliary:
             # sum_{heads,queries} Q K^T = X @ sum_queries(Q), for identity Q/K.
@@ -69,11 +77,20 @@ class Cropr(nn.Module):
         q = self.queries.expand(batch, -1, -1).reshape(
             batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
         kv = tokens.reshape(batch, count, self.num_heads, self.head_dim).transpose(1, 2)
+        # attn operation
         attn = q @ kv.transpose(-2, -1)
-        aggregate = ((attn * self.head_dim ** -0.5).softmax(-1) @ kv)
+        # softmax
+        weights = (attn * self.head_dim ** -0.5).softmax(-1)
+
+        aggregate = (weights @ kv)
         aggregate = aggregate.transpose(1, 2).reshape(batch, -1, dim)
         aggregate = self.proj(aggregate)
-        aggregate = aggregate + self.mlp(self.mlp_norm(aggregate))
+        # last two lines are the auxiliary head, which is used for training only. The auxiliary head is a linear layer that maps the aggregated features to the number of classes. The output of the auxiliary head is used to compute the auxiliary loss during training.
+        aggregate = aggregate + self.mlp(self.mlp_norm(aggregate))  
+
+        # attn.sum((1,2)) is the token scores that are used to select top-k toekns to keep
+        # self.head(aggregate) is the aux head that is used to calculate the aux training loss
+        # loss then back props through the model and gives training signal for scorer that determines top-k selection   
         return attn.sum((1, 2)), self.head(aggregate)
 
 
@@ -153,18 +170,6 @@ class CroprModel(nn.Module):
             self.model.backbone.eval()
         return self
 
-    @property
-    def backbone(self):
-        return self.model.backbone
-
-    @property
-    def classification_head(self):
-        return self.model.classification_head
-
-    @property
-    def segmentation_head(self):
-        return self.model.segmentation_head
-
     def forward(self, images, task=None, **kwargs):
         if task is not None and task != self.task:
             raise ValueError("This wrapper is configured for a different task")
@@ -216,6 +221,9 @@ class CroprModel(nn.Module):
                 return output
             # Keep all prefix/register tokens in their original slots. Maintain
             # spatial order among selected patches; rank only patch tokens.
+
+            # This keeps the highest-scoring patches and drops the lowest-scoring count patches.
+            # It implements top-k selection through sorting and slicing
             rank = scores[:, self.prefix:].argsort(dim=1, descending=True)
             keep_patch, drop = rank[:, :-count].sort(1).values + self.prefix, rank[:, -count:] + self.prefix
             prefix = torch.arange(self.prefix, device=x.device).expand(x.shape[0], -1)
@@ -243,6 +251,43 @@ class CroprModel(nn.Module):
         finally:
             self._active = False
 
+    def auxiliary_loss(self, target, *, ignore_index=255):
+        """Sum per-pruner CE losses as in the source; call after training forward.
+
+        Segmentation queries correspond to the original grid, never the selected
+        token order. Labels are nearest-resized to that grid. Hard labels only.
+        """
+        if not self.auxiliary_predictions:
+            raise RuntimeError("Run a training forward before requesting auxiliary loss")
+        losses = []
+        for prediction in self.auxiliary_predictions:
+            if self.task == "classification":
+                logits, labels = prediction[:, 0].float(), target
+            else:
+                logits = prediction.transpose(1, 2).reshape(
+                    prediction.shape[0], prediction.shape[-1], *self.grid_size).float()
+                labels = F.interpolate(target[:, None].float(), size=self.grid_size,
+                                       mode="nearest")[:, 0].long()
+            valid = labels != ignore_index
+            losses.append(F.cross_entropy(logits, labels, ignore_index=ignore_index,
+                                           reduction="sum") / valid.sum().clamp_min(1))
+        return torch.stack(losses).sum()
+
+    @property
+    def backbone(self):
+        return self.model.backbone
+
+
+    @property
+    def classification_head(self):
+        return self.model.classification_head
+
+
+    @property
+    def segmentation_head(self):
+        return self.model.segmentation_head
+
+
     def auxiliary_loss_sums(self, target, *, ignore_index=255):
         """Return summed CE across stages and valid target count for accumulation."""
         if not self.auxiliary_predictions:
@@ -261,14 +306,6 @@ class CroprModel(nn.Module):
                                           reduction="sum"))
         return torch.stack(losses).sum(), int((labels != ignore_index).sum().item())
 
-    def auxiliary_loss(self, target, *, ignore_index=255):
-        """Sum per-pruner CE losses as in the source; call after training forward.
-
-        Segmentation queries correspond to the original grid, never the selected
-        token order. Labels are nearest-resized to that grid. Hard labels only.
-        """
-        loss, count = self.auxiliary_loss_sums(target, ignore_index=ignore_index)
-        return loss / max(count, 1)
 
 
 def resolve_project_root(root=None):
@@ -532,3 +569,169 @@ def load_cropr_checkpoint(checkpoint, *, root=None, device="cpu"):
     model.pruners.load_state_dict(checkpoint["pruner_state_dict"], strict=True)
     getattr(model, f"{model.task}_head").load_state_dict(checkpoint["head_state_dict"], strict=True)
     return model.to(device).eval()
+
+
+class LoRALinear(nn.Module):
+    """Frozen linear plus (alpha/rank) * B(Ax).  Zero B preserves initial logits.
+
+    Fused QKV gets one rank-r update over the whole fused weight, not three
+    independent rank-r updates.  The exact targets and parameter count are saved.
+    """
+    def __init__(self, base, rank, alpha):
+        super().__init__()
+        if type(base) is not nn.Linear:
+            raise TypeError("LoRA requires an ordinary nn.Linear; review custom projections explicitly.")
+        if rank > min(base.in_features, base.out_features):
+            raise ValueError("LoRA rank exceeds a projection dimension.")
+        self.base = base.requires_grad_(False)
+        self.rank, self.alpha = rank, float(alpha)
+        self.scaling = self.alpha / rank
+        self.lora_A = nn.Parameter(base.weight.new_empty(rank, base.in_features))
+        self.lora_B = nn.Parameter(base.weight.new_zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    @property
+    def weight(self):
+        # Preserve correctness for attention implementations using F.linear
+        # directly instead of calling their projection module's forward.
+        return self.base.weight + self.scaling * (self.lora_B @ self.lora_A)
+
+    @property
+    def bias(self):
+        return self.base.bias
+
+    @property
+    def in_features(self):
+        return self.base.in_features
+
+    @property
+    def out_features(self):
+        return self.base.out_features
+
+    def forward(self, x):
+        return self.base(x) + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
+
+
+
+def _lora_modules(backbone):
+    return {n: m for n, m in backbone.named_modules() if isinstance(m, LoRALinear)}
+
+
+
+def _state_digest(state):
+    digest = hashlib.sha256()
+    for name, tensor in sorted(state.items()):
+        tensor = tensor.detach().cpu().contiguous()
+        digest.update(str((name, tuple(tensor.shape), str(tensor.dtype))).encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+
+def _frozen_backbone_digest(backbone):
+    # Normalize adapter wrapper keys back to their original pretrained names.
+    prefixes = tuple(_lora_modules(backbone))
+    state = {}
+    for name, value in backbone.state_dict().items():
+        if any(name == f"{p}.lora_A" or name == f"{p}.lora_B" for p in prefixes):
+            continue
+        for p in prefixes:
+            if name.startswith(p + ".base."):
+                name = p + "." + name[len(p + ".base."):]
+                break
+        state[name] = value
+    return _state_digest(state)
+
+
+
+def inject_lora(model, *, rank=8, alpha=16.0, targets=None,
+                unwrap_backbone_forward=True):
+    """Inject attention adapters in an existing model instance only.
+
+    targets, if supplied, are exact Linear paths relative to model.backbone.
+    Otherwise recognize fused qkv/proj or complete q_proj/k_proj/v_proj attention.
+    Never adapt pooling-only attention or MLPs automatically.
+    """
+    backbone = model.backbone
+    if _lora_modules(backbone):
+        raise ValueError("Backbone already contains LoRA adapters.")
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+        raise ValueError("LoRA rank must be a positive integer.")
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("LoRA alpha must be positive and finite.")
+    modules = dict(backbone.named_modules())
+    if targets is None:
+        targets = []
+        for name, module in modules.items():
+            if name.rsplit(".", 1)[-1] not in {"attn", "self_attn", "attention"}:
+                continue
+            children = dict(module.named_children())
+            if "qkv" in children:
+                leaves = ["qkv"] + (["proj"] if "proj" in children else [])
+            elif {"q_proj", "k_proj", "v_proj"}.issubset(children):
+                leaves = ["q_proj", "k_proj", "v_proj"]
+                leaves += [k for k in ("out_proj", "o_proj") if k in children]
+            else:
+                continue
+            targets.extend(f"{name}.{leaf}" for leaf in leaves)
+    targets = list(targets)
+    if not targets or len(set(targets)) != len(targets):
+        raise ValueError("No attention projections found, or duplicate LoRA targets.  Supply exact LORA_TARGETS.")
+    for name in targets:
+        if name not in modules or type(modules[name]) is not nn.Linear:
+            raise ValueError(f"Unsupported LoRA target: {name}")
+        if rank > min(modules[name].in_features, modules[name].out_features):
+            raise ValueError(f"LoRA rank exceeds dimensions of {name}")
+    backbone.requires_grad_(False)
+    for name in targets:
+        parent, _, leaf = name.rpartition(".")
+        setattr(backbone.get_submodule(parent), leaf, LoRALinear(modules[name], rank, alpha))
+    unwrapped = False
+    forward = backbone.forward
+    # The supplied FrozenBackbone has a single @torch.no_grad decorator.
+    # Remove one wrapper on this instance; never mutate the notebook class.
+    if unwrap_backbone_forward and hasattr(forward, "__wrapped__"):
+        backbone.forward = types.MethodType(forward.__wrapped__, backbone)
+        unwrapped = True
+    backbone.eval()
+    return {"rank": rank, "alpha": float(alpha), "dropout": 0.0,
+            "targets": targets, "unwrapped_backbone_forward": unwrapped,
+            "fused_qkv_policy": "one rank-r update over fused QKV weight",
+            "trainable_parameters": sum(p.numel() for p in backbone.parameters() if p.requires_grad)}
+
+
+
+def _adapter_state(backbone):
+    return {f"{n}.{key}": getattr(m, key).detach().cpu().clone()
+            for n, m in _lora_modules(backbone).items() for key in ("lora_A", "lora_B")}
+
+
+
+def _load_adapter_state(backbone, state):
+    parameters = {f"{n}.{key}": getattr(m, key)
+                  for n, m in _lora_modules(backbone).items() for key in ("lora_A", "lora_B")}
+    if parameters.keys() != state.keys():
+        raise ValueError("Adapter checkpoint target keys differ from this model.")
+    with torch.no_grad():
+        for name, parameter in parameters.items():
+            if parameter.shape != state[name].shape or not torch.isfinite(state[name]).all():
+                raise ValueError(f"Invalid adapter checkpoint tensor: {name}")
+            parameter.copy_(state[name])
+
+
+
+@torch.no_grad()
+def merge_lora(model):
+    """Merge once and remove adapters, leaving ordinary frozen Linear modules."""
+    modules = _lora_modules(model.backbone)
+    if not modules:
+        raise ValueError("No unmerged adapters found.")
+    for name, module in modules.items():
+        merged = module.weight
+        if not torch.isfinite(merged).all():
+            raise RuntimeError(f"Non-finite merged weight: {name}")
+        module.base.weight.copy_(merged)
+        parent, _, leaf = name.rpartition(".")
+        setattr(model.backbone.get_submodule(parent), leaf, module.base)
+    model.backbone.requires_grad_(False).eval()
+

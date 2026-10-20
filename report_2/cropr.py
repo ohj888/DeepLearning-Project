@@ -549,7 +549,7 @@ def build_cropr_model(name, task, *, root=None, variant="gradual_llf",
     return model
 
 
-def load_cropr_checkpoint(checkpoint, *, root=None, device="cpu"):
+def load_cropr_checkpoint(checkpoint, *, root=None, device="cpu", merge=True):
     """Rebuild from local pretrained weights and restore the learned head/pruners.
 
     Checkpoints are for evaluation/reconstruction, not optimizer-state resume.
@@ -566,6 +566,15 @@ def load_cropr_checkpoint(checkpoint, *, root=None, device="cpu"):
     model = build_cropr_model(checkpoint["model_name"], checkpoint["task"], root=root, **spec)
     if _state_digest(model.backbone.state_dict()) != checkpoint["pretrained_backbone_sha256"]:
         raise ValueError("Local pretrained backbone differs from the training checkpoint")
+    if checkpoint.get("adaptation_mode") == "lora_cropr" and not checkpoint.get("lora"):
+        raise ValueError("LoRA+Cropr checkpoint is missing adapter configuration")
+    if checkpoint.get("lora"):
+        spec = checkpoint["lora"]
+        inject_lora(model, rank=spec["rank"], alpha=spec["alpha"], targets=spec["targets"],
+                    unwrap_backbone_forward=False)
+        _load_adapter_state(model.backbone, checkpoint["lora_state_dict"])
+        if merge:
+            merge_lora(model)
     model.pruners.load_state_dict(checkpoint["pruner_state_dict"], strict=True)
     getattr(model, f"{model.task}_head").load_state_dict(checkpoint["head_state_dict"], strict=True)
     return model.to(device).eval()

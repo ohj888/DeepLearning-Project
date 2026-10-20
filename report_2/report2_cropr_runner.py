@@ -907,6 +907,10 @@ class _Runner:
             "epochs": c["EPOCHS"], "learning_rates": c["LR"], "weight_decay": c["WEIGHT_DECAY"],
             "cropr_variant": c["VARIANT"], "pruning_rate": c["PRUNING_RATE"],
             "cropr_lr": c["CROPR_LR"], "aux_weight": c["AUX_WEIGHT"],
+            "adaptation_mode": "lora_cropr",
+            "lora": {"rank": c["LORA_R"], "alpha": c["LORA_ALPHA"], "lr": c["LORA_LR"],
+                     "targets": c["LORA_TARGETS"], "dropout": 0.0},
+            "inference_lora_merged": True,
             "num_heads": c["NUM_HEADS"], "strict_determinism": c["STRICT_DETERMINISM"],
             "max_grad_norm": c["MAX_GRAD_NORM"] if math.isfinite(c["MAX_GRAD_NORM"]) else None,
             "optimizer": "AdamW", "scheduler": "CosineAnnealingLR",
@@ -1159,6 +1163,7 @@ def finish_cropr_step(model, optimizer, main_normalizer, main_count,
     head = getattr(model, f"{model.task}_head")
     for parameters, denominator, count in (
         (head.parameters(), main_normalizer, main_count),
+        ((p for p in model.backbone.parameters() if p.requires_grad), main_normalizer, main_count),
         (model.pruners.parameters(), aux_normalizer, aux_count),
     ):
         for p in parameters:
@@ -1170,6 +1175,10 @@ def finish_cropr_step(model, optimizer, main_normalizer, main_count,
     if not parameters:
         optimizer.zero_grad(set_to_none=True)
         return None
+    if main_count:
+        for name, module in cropr_module._lora_modules(model.backbone).items():
+            if module.lora_A.grad is None or module.lora_B.grad is None:
+                raise RuntimeError(f"Disconnected LoRA gradients: {name}")
     if aux_count and any(p.queries.grad is None for p in model.pruners.values()):
         raise RuntimeError("Disconnected Cropr queries; refusing silent head-only training")
     norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=True)
@@ -1224,11 +1233,19 @@ class _CroprRunner(_Runner):
         model = model.to(self.device)
         head = getattr(model, f'{task}_head')
         head.requires_grad_(True)
-        base_hash = _state_digest(model.backbone.state_dict())
+        base_hash = cropr_module._frozen_backbone_digest(model.backbone)
+        model.eval()
+        lora_spec = cropr_module.inject_lora(
+            model, rank=c['LORA_R'], alpha=c['LORA_ALPHA'],
+            targets=c['LORA_TARGETS'].get(name), unwrap_backbone_forward=False)
+        if cropr_module._frozen_backbone_digest(model.backbone) != base_hash:
+            raise RuntimeError('Pretrained weights changed during LoRA injection')
+        initial_adapters = cropr_module._adapter_state(model.backbone)
+        adapters = [p for p in model.backbone.parameters() if p.requires_grad]
         initial_queries = {k: p.queries.detach().cpu().clone() for k, p in model.pruners.items()}
-        allowed = {id(p) for p in list(head.parameters()) + list(model.pruners.parameters())}
+        allowed = {id(p) for p in list(head.parameters()) + list(model.pruners.parameters()) + adapters}
         if {id(p) for p in model.parameters() if p.requires_grad} != allowed:
-            raise RuntimeError('Unexpected trainable parameters outside the head/pruners')
+            raise RuntimeError('Unexpected trainable parameters outside the head/pruners/LoRA')
         # A real RGB dev image verifies shape, zero-pruning equivalence and query gradients.
         check_images, _ = next(iter(loaders['dev']))
         probe = check_images[:1].to(self.device)
@@ -1239,6 +1256,19 @@ class _CroprRunner(_Runner):
             with torch.no_grad():
                 expected = model.model(probe, task)
                 actual = model(probe, task)
+                originals = []
+                try:
+                    for path, module in cropr_module._lora_modules(model.backbone).items():
+                        parent, _, leaf = path.rpartition('.')
+                        owner = model.backbone.get_submodule(parent)
+                        originals.append((owner, leaf, module))
+                        setattr(owner, leaf, module.base)
+                    original_logits = model.model(probe, task)
+                    torch.testing.assert_close(expected, original_logits, rtol=0, atol=0)
+                finally:
+                    for owner, leaf, module in originals:
+                        setattr(owner, leaf, module)
+                del original_logits, originals
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         finally:
             model.schedule = saved_schedule
@@ -1257,19 +1287,32 @@ class _CroprRunner(_Runner):
             if grad is None or not torch.isfinite(grad).all() or not torch.count_nonzero(grad):
                 raise RuntimeError(f'Query gradient audit failed at stage {key}')
         if any(p.grad is not None for p in model.backbone.parameters()):
-            raise RuntimeError('Auxiliary loss must not update the frozen backbone')
+            raise RuntimeError('Auxiliary loss must not update the backbone or LoRA adapters')
+        actual.float().square().mean().backward()
+        for path, module in cropr_module._lora_modules(model.backbone).items():
+            for key in ('lora_A', 'lora_B'):
+                grad = getattr(module, key).grad
+                if grad is None or not torch.isfinite(grad).all():
+                    raise RuntimeError(f'LoRA gradient audit failed: {path}.{key}')
+        if not any(torch.count_nonzero(m.lora_B.grad).item()
+                   for m in cropr_module._lora_modules(model.backbone).values()):
+            raise RuntimeError('All LoRA B gradients are zero; refusing silent head-only training')
+        if any(p.grad is not None for p in model.backbone.parameters() if not p.requires_grad):
+            raise RuntimeError('Frozen pretrained parameters received gradients')
         model.zero_grad(set_to_none=True)
         model.auxiliary_predictions = []
         write_json(directory / 'cropr_setup.json', {
             **spec, 'schedule': model.schedule, 'prefix_tokens': model.prefix,
             'grid_size': model.grid_size, 'zero_pruning_equivalence': True,
             'query_gradient_connectivity': True, 'backbone_eval_mode': True,
+            'lora': lora_spec, 'lora_initial_equivalence': True, 'lora_gradient_connectivity': True,
             'pretrained_backbone_sha256': base_hash,
         })
         del probe, actual, expected, synthetic_target, audit_loss, check_images
         optimizer = torch.optim.AdamW([
             {'params': head.parameters(), 'lr': c['LR'][task], 'name': 'head'},
             {'params': model.pruners.parameters(), 'lr': c['CROPR_LR'], 'name': 'cropr'},
+            {'params': adapters, 'lr': c['LORA_LR'], 'name': 'lora'},
         ], weight_decay=c['WEIGHT_DECAY'])
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=c['EPOCHS'][task])
         metric = 'top1_pct' if task == 'classification' else 'miou_pct'
@@ -1326,11 +1369,14 @@ class _CroprRunner(_Runner):
             reserved = torch.cuda.max_memory_reserved() / 2**30
             if not main_count or not aux_count or not epoch_steps:
                 raise RuntimeError('No valid main/auxiliary targets or optimizer steps')
-            if _state_digest(model.backbone.state_dict()) != base_hash:
+            if cropr_module._frozen_backbone_digest(model.backbone) != base_hash:
                 raise RuntimeError('Frozen backbone changed during training')
             if not any(not torch.equal(p.queries.detach().cpu(), initial_queries[k])
                        for k, p in model.pruners.items()):
                 raise RuntimeError('Queries did not change; refusing silent head-only training')
+            current_adapters = cropr_module._adapter_state(model.backbone)
+            if not any(not torch.equal(v, initial_adapters[k]) for k,v in current_adapters.items()):
+                raise RuntimeError('LoRA adapters did not change; refusing silent head-only training')
             total_steps += epoch_steps
             total_images += epoch_images
             started = time.perf_counter()
@@ -1339,6 +1385,7 @@ class _CroprRunner(_Runner):
             row = dict(training_mode='cropr', train_precision=c['TRAIN_PRECISION'], epoch=epoch,
                        evaluation_precision='fp32', evaluation_tf32=c['EVAL_TF32'],
                        lr=optimizer.param_groups[0]['lr'], cropr_lr=optimizer.param_groups[1]['lr'],
+                       lora_lr=optimizer.param_groups[2]['lr'], adaptation_mode='lora_cropr',
                        train_loss=main_sum / main_count, train_aux_loss=aux_sum / aux_count,
                        train_total_loss=main_sum / main_count + c['AUX_WEIGHT'] * aux_sum / aux_count,
                        train_seconds=train_seconds, train_images_per_second=epoch_images / train_seconds,
@@ -1352,12 +1399,13 @@ class _CroprRunner(_Runner):
             write_csv(directory / 'epochs.csv', history)
             checkpoint = dict(
                 model_name=name, task=task, epoch=epoch, cropr=spec,
+                lora=lora_spec, lora_state_dict=current_adapters, adaptation_mode='lora_cropr',
                 training_mode='cropr', train_precision=c['TRAIN_PRECISION'], evaluation_precision='fp32',
                 evaluation_tf32=c['EVAL_TF32'], input_size=c['SIZE'], feature_dim=model.backbone.feature_dim,
                 head_state_dict={k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
                 pruner_state_dict={k: v.detach().cpu().clone() for k, v in model.pruners.state_dict().items()},
                 pretrained_backbone_sha256=base_hash, dev_metrics=dev, seed=c['SEED'],
-                checkpoint_format_version=1, resume_supported=False,
+                checkpoint_format_version=2, resume_supported=False,
             )
             atomic_torch_save(checkpoint, directory / 'last_cropr.pt')
             if dev[metric] > best_score:
@@ -1367,10 +1415,11 @@ class _CroprRunner(_Runner):
             scheduler.step()
             print(f"  main={row['train_loss']:.4f}, aux={row['train_aux_loss']:.4f} | dev {metric}={dev[metric]:.2f} | peak={allocated:.2f} GiB")
         fit_seconds = time.perf_counter() - fit_start
-        del optimizer, scheduler, initial_queries
+        del optimizer, scheduler, initial_queries, initial_adapters, adapters, current_adapters
         checkpoint = torch.load(directory / 'best_cropr.pt', map_location='cpu', weights_only=True)
         head.load_state_dict(checkpoint['head_state_dict'])
         model.pruners.load_state_dict(checkpoint['pruner_state_dict'])
+        cropr_module._load_adapter_state(model.backbone, checkpoint['lora_state_dict'])
         del checkpoint
         compute = {}
         images, target = next(iter(loaders['train']))
@@ -1381,6 +1430,25 @@ class _CroprRunner(_Runner):
             compute['training_profiling_error'] = str(exc)
             (directory / 'training_profiling_error.txt').write_text(traceback.format_exc(), encoding='utf-8')
         del images, target
+        model.eval()
+        merge_images = loaders['dev'].dataset[0][0].unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            before_merge = model(merge_images, task)
+            tokens_before_merge = list(model.token_stats)
+            cropr_module.merge_lora(model)
+            after_merge = model(merge_images, task)
+            if not torch.isfinite(before_merge).all() or not torch.isfinite(after_merge).all():
+                raise RuntimeError('Non-finite logits during LoRA merge validation')
+            torch.testing.assert_close(after_merge, before_merge, rtol=1e-4, atol=1e-3)
+            if model.token_stats != tokens_before_merge:
+                raise RuntimeError('LoRA merge changed the pruning schedule')
+            merge_error = float((after_merge - before_merge).abs().max())
+        write_json(directory / 'lora_merge_validation.json', {
+            'passed': True, 'max_absolute_logit_error': merge_error,
+            'rtol': 1e-4, 'atol': 1e-3, 'images_checked': 1,
+            'cropr_active': True, 'inference_lora_merged': True,
+        })
+        del merge_images, before_merge, after_merge
         gc.collect()
         torch.cuda.empty_cache()
         started = time.perf_counter()
@@ -1420,7 +1488,8 @@ class _CroprRunner(_Runner):
         profiling_path = directory / 'profiling.json'
         profiling = json.loads(profiling_path.read_text(encoding='utf-8')) if profiling_path.exists() else {}
         write_json(profiling_path, {**profiling, **compute, **token_summary,
-                                   'profile_training_scope': 'RGB forward + main/auxiliary backward; no optimizer'})
+                                   'inference_lora_merged': True,
+                                   'profile_training_scope': 'RGB forward + LoRA/head/pruner backward; no optimizer'})
         result = dict(
             model=name, task=task, status='completed', seed=c['SEED'], resolution=c['SIZE'],
             batch_size=c['BATCH_SIZE'], epochs=c['EPOCHS'][task], micro_batch_size=c['MICRO_BATCH_SIZE'],
@@ -1440,14 +1509,15 @@ class _CroprRunner(_Runner):
             fit_seconds_including_dev_and_saves=fit_seconds, heldout_evaluation_seconds=test_seconds,
             train_peak_allocated_gib=max(r['train_peak_allocated_gib'] for r in history),
             train_peak_reserved_gib=max(r['train_peak_reserved_gib'] for r in history),
-            inference_scope='full RGB Cropr model; auxiliary aggregation/heads skipped; no feature cache',
-            profile_training_scope='RGB forward + main/auxiliary backward; no optimizer',
+            inference_scope='merged LoRA + full RGB Cropr model; auxiliary aggregation/heads skipped; no feature cache',
+            profile_training_scope='RGB forward + LoRA/head/pruner backward; no optimizer',
             pretrained_backbone_sha256=base_hash, frozen_state_verified=True,
             best_checkpoint_path=str(directory / 'best_cropr.pt'),
             experiment_seconds_including_measurements=time.perf_counter() - experiment_start,
             # Preserve baseline report fields with explicit N/A, never fabricated zeros.
-            trainable_lora_parameters=None, lora_rank=None, lora_alpha=None, lora_lr=None,
-            inference_lora_merged=None, merge_max_absolute_logit_error=None,
+            trainable_lora_parameters=lora_spec['trainable_parameters'], lora_rank=lora_spec['rank'],
+            lora_alpha=lora_spec['alpha'], lora_lr=c['LORA_LR'], adaptation_mode='lora_cropr',
+            inference_lora_merged=True, merge_max_absolute_logit_error=merge_error,
             cache_train_seconds=None, cache_dev_seconds=None, head_training_seconds=None,
             pipeline_fit_seconds_including_cache_dev_and_saves=None,
             **{f'heldout_{k}': v for k, v in heldout.items()}, **speed, **compute, **token_summary,
@@ -1460,6 +1530,7 @@ def run_cropr(*, ROOT=None, SEED=42, SIZE=448,
               MODEL_NAMES=('dinov2', 'siglip2', 'radio'), TASKS=('classification', 'segmentation'),
               VARIANT='gradual_llf', PRUNING_RATE=8, NUM_HEADS=1, CROPR_LR=1e-4, AUX_WEIGHT=1.0,
               EPOCHS=None, LR=None, WEIGHT_DECAY=0.01,
+              LORA_R=8, LORA_ALPHA=16.0, LORA_LR=1e-4, LORA_TARGETS=None,
               BATCH_SIZE=2, MICRO_BATCH_SIZE=1, GRAD_ACCUM_STEPS=16, EVAL_BATCH_SIZE=1,
               TRAIN_PRECISION='bf16', MAX_GRAD_NORM=1.0, EVAL_TF32=False, STRICT_DETERMINISM=False,
               NUM_WORKERS=4, LOADER_BACKEND='thread', FAIL_FAST=True,
@@ -1477,6 +1548,12 @@ def run_cropr(*, ROOT=None, SEED=42, SIZE=448,
     ADE_ROOT = Path(ADE_ROOT) if ADE_ROOT is not None else ROOT / 'datasets/ade20k/ADEChallengeData2016'
     SPLIT_ROOT = Path(SPLIT_ROOT) if SPLIT_ROOT is not None else ROOT / 'datasets/splits'
     ATTENTION_MODULE_NAMES = dict(ATTENTION_MODULE_NAMES or {})
+    LORA_TARGETS = dict(LORA_TARGETS or {})
+    if type(LORA_R) is not int or LORA_R < 1:
+        raise ValueError('LORA_R must be a positive integer')
+    if any(not isinstance(v, (list, tuple)) or not all(isinstance(n, str) for n in v)
+           for v in LORA_TARGETS.values()):
+        raise ValueError('LORA_TARGETS must map model names to exact attention projection paths')
     MODEL_NAMES, TASKS = tuple(MODEL_NAMES), tuple(TASKS)
     if not TASKS or len(set(TASKS)) != len(TASKS) or any(t not in {'classification','segmentation'} for t in TASKS):
         raise ValueError('TASKS must contain classification/segmentation without duplicates')
@@ -1496,9 +1573,9 @@ def run_cropr(*, ROOT=None, SEED=42, SIZE=448,
         raise ValueError('WEIGHT_DECAY must be finite and nonnegative')
     if math.isnan(MAX_GRAD_NORM) or MAX_GRAD_NORM <= 0:
         raise ValueError('MAX_GRAD_NORM must be positive')
-    for v in (CROPR_LR, AUX_WEIGHT):
+    for v in (CROPR_LR, AUX_WEIGHT, LORA_ALPHA, LORA_LR):
         if not math.isfinite(v) or v <= 0:
-            raise ValueError('CROPR_LR and AUX_WEIGHT must be positive and finite')
+            raise ValueError('Learning rates, auxiliary weight and LoRA alpha must be positive and finite')
     for task in TASKS:
         if type(EPOCHS.get(task)) is not int or EPOCHS[task] < 1 or not math.isfinite(LR.get(task, 0)) or LR.get(task, 0) <= 0:
             raise ValueError(f'{task} requires positive epochs and learning rate')

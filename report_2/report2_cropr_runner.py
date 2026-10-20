@@ -1,112 +1,96 @@
-"""Frozen cached-head and optional uncached LoRA baseline experiments.
+"""Cropr experiments with Report 1 dataset, evaluation and measurement conventions.
 
-TRAIN_PRECISION="bf16" uses BF16 autocast for training forwards, with FP32
-parameters and loss. EVAL_TF32 optionally enables TF32 only in evaluate().
-COMPILE_LORA optionally compiles the training forward, with eager retry on failure.
-Merge audits, cache extraction and inference benchmarks keep TF32 disabled.
-LOADER_BACKEND="thread", NUM_WORKERS=2 enables bounded CPU image prefetch in two
-threads without Windows child interpreters. "process" retains spawn DataLoaders.
-FAIL_FAST=True saves errors and stops instead of allocating another model.
-
-
-TRAINING_MODE="lora" is the default: attention adapters plus the task head
-train from RGB, never cached features.  Optional cached_head mode trains only heads.
-LoRA defaults: rank 8, alpha 16, LR 1e-4, dropout 0; separate head LR.
-The runner handles the supplied FrozenBackbone's @torch.no_grad wrapper on
-its own model instance. Nested inference/no_grad blocks fail the gradient audit.
-Best/last LoRA checkpoints contain adapters AND head, plus a base-weight hash.
-Use load_baseline_checkpoint on the same original pretrained model to reload.
-No automatic resume. Inference measurements and held-out scores use merged LoRA.
-LoRA requires activation memory: a small adapter does not make training as cheap
-as cached head fitting. The runner never silently reduces batch size on OOM.
-448 defaults for an RTX 4060 Laptop with 8 GiB VRAM / 16 GiB RAM:
-LoRA microbatch 1, accumulation 16, eval batch 1, benchmark batch 2.
-These settings require on-device memory validation; no fit guarantee.
-BATCH_SIZE describes inference; MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS describes training.
-Final partial windows and ignored segmentation pixels use exact valid-target normalization.
-
-
-Run the notebook's existing BaselineModel definition first, then call:
-    run_baselines(BaselineModel, ROOT=Path.cwd(),
-                  EPOCHS={"classification": 3, "segmentation": 5})
-
-In cached_head mode, train/dev features are built fresh. Train stores both RGB
-orientations; dev stores the original. Cache arrays are float32 disk-backed NPY.
-No cross-run cache reuse or automatic training resume is performed. Completed frozen-head
-checkpoints are saved each epoch; restarting this function starts a new run.
-Cached training is ONLY for a deterministic, entirely frozen backbone, and the
-original mean-pool classification / spatial segmentation head interfaces.
-Full-model held-out evaluation, FLOPs and timings always use real RGB images.
-Cache extraction + head fit costs are recorded separately and together.
-Importing this file never starts training. For scripts guard calls with
-if __name__ == "__main__": . Notebook factories remain in the parent process.
-
-Metric guide (all accuracy values are percentages):
-  heldout_top1_pct / top5_pct: classification quality; Top-1 is primary.
-  heldout_miou_pct: mean class intersection/union; segmentation primary.
-  heldout_pixel_accuracy_pct: overall pixel correctness; frequent classes dominate.
-  classes_with_nonzero_union: denominator of mIoU; absent classes are excluded.
-  train/dev/heldout_loss: cross-entropy learning/overfitting diagnostic. ADE loss
-    uses valid pixels only; do not compare its magnitude to classification loss.
-  whole_model_forward_gflops_per_image: primary algorithmic compute estimate.
-  attention_forward_gflops_per_image: attention-only compute diagnostic.
-    Both use 2 FLOPs/MAC, include supported dense matmul/conv/SDPA, and exclude
-    elementwise work, softmax, normalization and data movement. Unknown coverage
-    yields null, never a fabricated total. GMACs = GFLOPs / 2 in this convention.
-  FLOP batch mean/std/min/max: input-dependent compute variation, NOT seed variance.
-  forward[_backward]_partial_gflops_per_image: profiler diagnostic only; NOT a
-    substitute for audited whole-model counts. Backward excludes optimizer work.
-  b1/bB latency median/p95 (ms per BATCH): typical/tail device-stream delay.
-  b1/bB images_per_second: CUDA-stream throughput. wall_images_per_second also
-    includes host launch overhead. Both exclude data loading and input transfer.
-  throughput std: repeated timing trials, NOT accuracy confidence intervals.
-  peak_allocated_gib: peak live CUDA tensors (includes resident model/inputs).
-  peak_reserved_gib: allocator pool size, including reusable cached blocks.
-  attention/mlp/head/other GPU time and percentages: bottleneck diagnostics;
-    attribution unavailable => percentages null. These are NOT FLOP shares.
-  train_seconds / train_images_per_second / peak memory: adaptation cost.
-  cache time/bytes/backbone forwards: frozen-mode extraction and storage cost.
-  fit/heldout/experiment seconds: pipeline budgeting; scopes differ explicitly.
-  backbone/head/LoRA parameter counts: model size and adaptation capacity.
-  epochs, LRs, images, optimizer steps, best dev epoch/score, gradient norms,
-    split/source/base hashes and environment: audit/reproducibility metadata.
-
-Suggested main results: Top-1 or mIoU + whole-model GFLOPs + batch-1 latency +
-batch-B wall throughput + peak allocated memory. Keep remaining diagnostics in
-appendices. Same hardware, precision, resolution, batch and training budget are
-needed for comparisons. A single training seed does not establish significance.
-ADE masks here are resized to SIZE, not standard full-resolution ADE evaluation.
-Reference: ToMe (arxiv.org/abs/2210.09461) reports throughput alongside accuracy;
-LoRA (arxiv.org/abs/2106.09685) merges updates into weights for inference.
+All outputs stay under report_2. Importing does not start training.
 """
+
+
+try:
+    from . import cropr as cropr_module
+except ImportError:
+    import cropr as cropr_module
+
+
 import csv
+
+
 import gc
+
+
 import hashlib
+
+
 import importlib.metadata
+
+
 import json
+
+
 import math
+
+
 import types
+
+
 import os
+
+
 import platform
+
+
 import random
+
+
 import shutil
+
+
 import time
+
+
 import threading
+
+
 import traceback
+
+
 from concurrent.futures import ThreadPoolExecutor
+
+
 from collections import deque
+
+
 from collections import Counter
+
+
 from contextlib import contextmanager
+
+
 from datetime import datetime
+
+
 from pathlib import Path
 
+
 import numpy as np
+
+
 import torch
+
+
 from PIL import Image
+
+
 from torch import nn
+
+
 from torch.nn import functional as F
+
+
 from torch.profiler import ProfilerActivity, profile, record_function
+
+
 from torch.utils.data import DataLoader, Dataset, default_collate
+
+
 from tqdm.auto import tqdm
 
 
@@ -155,64 +139,6 @@ def evaluation_tf32(enabled):
             setattr(obj, key, saved)
 
 
-class _LoRATrainingForward:
-    """Compile a callable, never wrap the model or change checkpoint keys.
-
-    Include backward in the retry boundary: AOT compilation is lazy. Restore
-    accumulated gradients and RNG before eager retry; optimizer steps stay outside.
-    """
-    def __init__(self, model, enabled=False, backend="inductor", mode="default", report=None):
-        self.model, self.forward, self.report = model, model, report
-        self.info = dict(requested=enabled, backend=backend, mode=mode,
-                         active=False, error=None, torch=str(torch.__version__),
-                         python=platform.python_version(), platform=platform.platform(),
-                         triton=package_version("triton") or package_version("triton-windows"))
-        if enabled:
-            try:
-                self.forward = torch.compile(model.forward, backend=backend, mode=mode)
-                self.info["active"] = True
-            except Exception as exc:
-                self.disable(exc)
-        self.record()
-
-    def record(self):
-        if self.report is not None:
-            write_json(self.report, self.info)
-
-    def disable(self, exc):
-        self.forward = self.model
-        self.info.update(active=False, error=f"{type(exc).__name__}: {exc}")
-        print("LoRA compilation failed; retaining eager execution:", self.info["error"])
-        self.record()
-
-    def backward(self, images, target, task, normalizer, autocast):
-        def step():
-            with autocast():
-                logits = self.forward(images, task)
-            loss, count = loss_sum_and_count(logits.float(), target, task)
-            if not torch.isfinite(logits).all() or not torch.isfinite(loss):
-                raise RuntimeError("Non-finite training logits/loss; optimizer not updated.")
-            if count:
-                (loss / normalizer).backward()
-            return logits, loss, count
-
-        if not self.info["active"]:
-            return step()
-        parameters = [p for p in self.model.parameters() if p.requires_grad]
-        gradients = [None if p.grad is None else p.grad.clone() for p in parameters]
-        cpu_rng = torch.get_rng_state()
-        cuda_rng = torch.cuda.get_rng_state_all()
-        try:
-            return step()
-        except Exception as exc:
-            for p, grad in zip(parameters, gradients):
-                p.grad = grad
-            torch.set_rng_state(cpu_rng)
-            torch.cuda.set_rng_state_all(cuda_rng)
-            self.disable(exc)
-        return step()
-
-
 def write_json(path, obj):
     path = Path(path)
     temporary = path.with_name(path.name + ".tmp")
@@ -227,51 +153,6 @@ def atomic_torch_save(obj, path):
     os.replace(temporary, path)
 
 
-class LoRALinear(nn.Module):
-    """Frozen linear plus (alpha/rank) * B(Ax).  Zero B preserves initial logits.
-
-    Fused QKV gets one rank-r update over the whole fused weight, not three
-    independent rank-r updates.  The exact targets and parameter count are saved.
-    """
-    def __init__(self, base, rank, alpha):
-        super().__init__()
-        if type(base) is not nn.Linear:
-            raise TypeError("LoRA requires an ordinary nn.Linear; review custom projections explicitly.")
-        if rank > min(base.in_features, base.out_features):
-            raise ValueError("LoRA rank exceeds a projection dimension.")
-        self.base = base.requires_grad_(False)
-        self.rank, self.alpha = rank, float(alpha)
-        self.scaling = self.alpha / rank
-        self.lora_A = nn.Parameter(base.weight.new_empty(rank, base.in_features))
-        self.lora_B = nn.Parameter(base.weight.new_zeros(base.out_features, rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-    @property
-    def weight(self):
-        # Preserve correctness for attention implementations using F.linear
-        # directly instead of calling their projection module's forward.
-        return self.base.weight + self.scaling * (self.lora_B @ self.lora_A)
-
-    @property
-    def bias(self):
-        return self.base.bias
-
-    @property
-    def in_features(self):
-        return self.base.in_features
-
-    @property
-    def out_features(self):
-        return self.base.out_features
-
-    def forward(self, x):
-        return self.base(x) + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
-
-
-def _lora_modules(backbone):
-    return {n: m for n, m in backbone.named_modules() if isinstance(m, LoRALinear)}
-
-
 def _state_digest(state):
     digest = hashlib.sha256()
     for name, tensor in sorted(state.items()):
@@ -279,152 +160,6 @@ def _state_digest(state):
         digest.update(str((name, tuple(tensor.shape), str(tensor.dtype))).encode())
         digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
-
-
-def _frozen_backbone_digest(backbone):
-    # Normalize adapter wrapper keys back to their original pretrained names.
-    prefixes = tuple(_lora_modules(backbone))
-    state = {}
-    for name, value in backbone.state_dict().items():
-        if any(name == f"{p}.lora_A" or name == f"{p}.lora_B" for p in prefixes):
-            continue
-        for p in prefixes:
-            if name.startswith(p + ".base."):
-                name = p + "." + name[len(p + ".base."):]
-                break
-        state[name] = value
-    return _state_digest(state)
-
-
-def inject_lora(model, *, rank=8, alpha=16.0, targets=None,
-                unwrap_backbone_forward=True):
-    """Inject attention adapters in an existing model instance only.
-
-    targets, if supplied, are exact Linear paths relative to model.backbone.
-    Otherwise recognize fused qkv/proj or complete q_proj/k_proj/v_proj attention.
-    Never adapt pooling-only attention or MLPs automatically.
-    """
-    backbone = model.backbone
-    if _lora_modules(backbone):
-        raise ValueError("Backbone already contains LoRA adapters.")
-    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
-        raise ValueError("LoRA rank must be a positive integer.")
-    if not math.isfinite(alpha) or alpha <= 0:
-        raise ValueError("LoRA alpha must be positive and finite.")
-    modules = dict(backbone.named_modules())
-    if targets is None:
-        targets = []
-        for name, module in modules.items():
-            if name.rsplit(".", 1)[-1] not in {"attn", "self_attn", "attention"}:
-                continue
-            children = dict(module.named_children())
-            if "qkv" in children:
-                leaves = ["qkv"] + (["proj"] if "proj" in children else [])
-            elif {"q_proj", "k_proj", "v_proj"}.issubset(children):
-                leaves = ["q_proj", "k_proj", "v_proj"]
-                leaves += [k for k in ("out_proj", "o_proj") if k in children]
-            else:
-                continue
-            targets.extend(f"{name}.{leaf}" for leaf in leaves)
-    targets = list(targets)
-    if not targets or len(set(targets)) != len(targets):
-        raise ValueError("No attention projections found, or duplicate LoRA targets.  Supply exact LORA_TARGETS.")
-    for name in targets:
-        if name not in modules or type(modules[name]) is not nn.Linear:
-            raise ValueError(f"Unsupported LoRA target: {name}")
-        if rank > min(modules[name].in_features, modules[name].out_features):
-            raise ValueError(f"LoRA rank exceeds dimensions of {name}")
-    backbone.requires_grad_(False)
-    for name in targets:
-        parent, _, leaf = name.rpartition(".")
-        setattr(backbone.get_submodule(parent), leaf, LoRALinear(modules[name], rank, alpha))
-    unwrapped = False
-    forward = backbone.forward
-    # The supplied FrozenBackbone has a single @torch.no_grad decorator.
-    # Remove one wrapper on this instance; never mutate the notebook class.
-    if unwrap_backbone_forward and hasattr(forward, "__wrapped__"):
-        backbone.forward = types.MethodType(forward.__wrapped__, backbone)
-        unwrapped = True
-    backbone.eval()
-    return {"rank": rank, "alpha": float(alpha), "dropout": 0.0,
-            "targets": targets, "unwrapped_backbone_forward": unwrapped,
-            "fused_qkv_policy": "one rank-r update over fused QKV weight",
-            "trainable_parameters": sum(p.numel() for p in backbone.parameters() if p.requires_grad)}
-
-
-def _adapter_state(backbone):
-    return {f"{n}.{key}": getattr(m, key).detach().cpu().clone()
-            for n, m in _lora_modules(backbone).items() for key in ("lora_A", "lora_B")}
-
-
-def _load_adapter_state(backbone, state):
-    parameters = {f"{n}.{key}": getattr(m, key)
-                  for n, m in _lora_modules(backbone).items() for key in ("lora_A", "lora_B")}
-    if parameters.keys() != state.keys():
-        raise ValueError("Adapter checkpoint target keys differ from this model.")
-    with torch.no_grad():
-        for name, parameter in parameters.items():
-            if parameter.shape != state[name].shape or not torch.isfinite(state[name]).all():
-                raise ValueError(f"Invalid adapter checkpoint tensor: {name}")
-            parameter.copy_(state[name])
-
-
-@torch.no_grad()
-def merge_lora(model):
-    """Merge once and remove adapters, leaving ordinary frozen Linear modules."""
-    modules = _lora_modules(model.backbone)
-    if not modules:
-        raise ValueError("No unmerged adapters found.")
-    for name, module in modules.items():
-        merged = module.weight
-        if not torch.isfinite(merged).all():
-            raise RuntimeError(f"Non-finite merged weight: {name}")
-        module.base.weight.copy_(merged)
-        parent, _, leaf = name.rpartition(".")
-        setattr(model.backbone.get_submodule(parent), leaf, module.base)
-    model.backbone.requires_grad_(False).eval()
-
-
-def load_baseline_checkpoint(model, checkpoint, *, merge=True):
-    """Restore head and, for LoRA, adapters against the verified original weights.
-
-    Construct model with the original pretrained weights first.  No automatic
-    training resume is provided.  merge=True is intended for inference.
-    """
-    if isinstance(checkpoint, (str, Path)):
-        checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    if checkpoint.get("training_mode") == "lora":
-        if _frozen_backbone_digest(model.backbone) != checkpoint["pretrained_backbone_sha256"]:
-            raise ValueError("Pretrained backbone differs from the LoRA checkpoint base.")
-        spec = checkpoint["lora"]
-        inject_lora(model, rank=spec["rank"], alpha=spec["alpha"], targets=spec["targets"],
-                    unwrap_backbone_forward=spec["unwrapped_backbone_forward"])
-        _load_adapter_state(model.backbone, checkpoint["lora_state_dict"])
-        if merge:
-            merge_lora(model)
-    getattr(model, f"{checkpoint['task']}_head").load_state_dict(checkpoint["head_state_dict"], strict=True)
-    return model
-
-
-def _check_gradients(model, parameters, max_norm):
-    if any(p.grad is not None for p in model.parameters() if not p.requires_grad):
-        raise RuntimeError("A frozen parameter received a gradient.")
-    # error_if_nonfinite rejects NaN/Inf BEFORE the optimizer changes weights.
-    return float(nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=True))
-
-
-def _finish_accumulated_step(model, optimizer, parameters, normalizer, valid_count, max_norm):
-    """Normalize accumulated summed gradients BEFORE checking/clipping/updating."""
-    if valid_count <= 0:
-        raise ValueError("Accumulated optimizer step needs valid targets.")
-    scale = normalizer / valid_count
-    for parameter in parameters:
-        if parameter.grad is not None:
-            parameter.grad.mul_(scale)
-    norm = _check_gradients(model, parameters, max_norm)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    return norm
 
 
 def write_csv(path, rows):
@@ -676,10 +411,6 @@ def component_labels(model, task):
             module.forward = original
 
 
-# Attention counts use the dense-matmul convention: one multiply-add = 2 FLOPs.
-# These lists make deliberate exclusions visible instead of claiming every
-# arithmetic instruction is counted.  An unrecognized operation blocks the
-# comparable summary value until its coverage is reviewed.
 _ATTENTION_LAYOUT_OPS = {
     # Embedding gathers table rows; no matrix/conv arithmetic is performed.
     'embedding',
@@ -693,6 +424,8 @@ _ATTENTION_LAYOUT_OPS = {
     'full', 'full_like', 'fill_', 'zero_', 'arange', 'scalar_tensor',
     '_local_scalar_dense', 'is_nonzero', 'resolve_conj', 'resolve_neg',
 }
+
+
 _ATTENTION_EXCLUDED_ARITHMETIC = {
     'add', 'add_', 'sub', 'sub_', 'mul', 'mul_', 'div', 'div_', 'neg', 'pow',
     'exp', 'log', 'sqrt', 'rsqrt', 'sin', 'cos', 'softmax', '_softmax',
@@ -1030,8 +763,6 @@ def measure_flops_on_dataset(model, dataset, task, batch_size, batches, seed,
     return summary
 
 
-
-
 def _component_time_summary(prof, matched):
     """Partition exclusive CPU-attributed CUDA time by enclosing component.
 
@@ -1086,192 +817,9 @@ def _component_time_summary(prof, matched):
     }
 
 
-class CachedFeatureDataset(Dataset):
-    """Memory-map features lazily; each returned array is an owned writable copy.
-
-    Cache loaders deliberately use zero workers: small pooled features do not
-    benefit from Windows spawn and dense features otherwise multiply RAM use.
-    """
-    def __init__(self, directory, training=False):
-        self.directory = Path(directory)
-        self.meta = json.loads((self.directory / "cache.json").read_text())
-        if not self.meta.get("complete"):
-            raise ValueError(f"Incomplete feature cache: {directory}")
-        self.training = training
-        if training and self.meta["views"] != 2:
-            raise ValueError("Training cache must contain both orientations.")
-        self._features = self._targets = None
-
-    def __len__(self):
-        return self.meta["images"]
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state["_features"] = state["_targets"] = None
-        return state
-
-    def __getitem__(self, index):
-        if self._features is None:
-            self._features = np.load(self.directory / "features.npy", mmap_mode="r")
-            self._targets = np.load(self.directory / "targets.npy", mmap_mode="r")
-        flip = self.training and random.random() < 0.5
-        view = int(flip)
-        features = torch.from_numpy(np.array(self._features[index, view], copy=True))
-        if self.meta["task"] == "classification":
-            return features, int(self._targets[index])
-        target = self._targets[index]
-        if flip:
-            target = np.flip(target, axis=-1)
-        return features, torch.from_numpy(np.array(target, dtype=np.int64, copy=True))
-
-    def close(self):
-        for key in ("_features", "_targets"):
-            array = getattr(self, key)
-            if array is not None:
-                array._mmap.close()
-                setattr(self, key, None)
-
-
-class _HeadFromCache(nn.Module):
-    def __init__(self, head, task, grid, size):
-        super().__init__()
-        self.head, self.task = head, task
-        self.grid, self.size = tuple(grid), size
-
-    def forward(self, features, task):
-        if task != self.task:
-            raise ValueError("Cached head task mismatch.")
-        if task == "classification":
-            # Stored [B,1,D]; the original head's mean over one token is identity.
-            return self.head(features)
-        return self.head(features, self.grid, (self.size, self.size))
-
-
-def _validate_cache_tensor(actual, expected, *, label, report, atol=1e-4):
-    """Check float32 equivalence; record diagnostics even when validation fails."""
-    row = {"label": label, "rtol": 1e-4, "atol": atol,
-           "actual_shape": list(actual.shape), "expected_shape": list(expected.shape)}
-    report.append(row)
-    if actual.shape != expected.shape:
-        row["passed"] = False
-        raise RuntimeError(f"{label}: cache shape mismatch.")
-    if not (torch.isfinite(actual).all() and torch.isfinite(expected).all()):
-        row["passed"] = False
-        raise RuntimeError(f"{label}: nonfinite cache validation values.")
-    error = (actual - expected).abs()
-    row["max_abs_error"] = float(error.max().item())
-    row["mean_abs_error"] = float(error.mean().item())
-    row["passed"] = bool(torch.all(error <= atol + 1e-4 * expected.abs()).item())
-    if not row["passed"]:
-        raise RuntimeError(f"{label}: cache validation failed: {row}")
-
-
-def _cache_features(patches, task):
-    if not isinstance(patches, torch.Tensor) or patches.ndim != 3:
-        raise ValueError("Expected backbone patches [B,N,D].")
-    if not torch.isfinite(patches).all():
-        raise RuntimeError("Nonfinite backbone features.")
-    return patches.float().mean(1, keepdim=True) if task == "classification" else patches.float()
-
-
-@torch.no_grad()
-def build_feature_cache(model, dataset, task, part, directory, *,
-                        device, batch_size, num_workers, seed, loader_backend="process"):
-    """One original + one flipped backbone forward per training image.
-
-    dataset must disable random augmentation. Targets are stored once; the
-    corresponding segmentation target is flipped when a flipped view is read.
-    """
-    if dataset.part == "train":
-        raise ValueError("Extraction dataset must disable random augmentation.")
-    if any(p.requires_grad for p in model.backbone.parameters()):
-        raise ValueError("Cannot cache a trainable backbone.")
-    model.eval()
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=False)
-    views = 2 if part == "train" else 1
-    worker_args = {"multiprocessing_context": "spawn", "prefetch_factor": 1} if num_workers else {}
-    if num_workers and loader_backend == "thread":
-        loader = ThreadedImageLoader(dataset, batch_size, num_workers, False, seed,
-                                     pin_memory=device.type == "cuda")
-    else:
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=device.type == "cuda",
-                            worker_init_fn=seed_worker, persistent_workers=False,
-                            generator=torch.Generator().manual_seed(seed), **worker_args)
-    is_cuda = device.type == "cuda"
-    if is_cuda:
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
-    start = time.perf_counter()
-    feature_array = target_array = None
-    offset = 0
-    meta = {"complete": False, "task": task, "part": part,
-            "images": len(dataset), "views": views, "dtype": "float32",
-            "size": dataset.size, "augmentation": "both horizontal orientations"}
-    write_json(directory / "cache.json", meta)
-    try:
-        for images, targets in timed_image_batches(loader, f"Cache {task}/{part}"):
-            images = images.to(device, non_blocking=True)
-            patches, grid = model.backbone(images)
-            features = _cache_features(patches, task)
-            grid = tuple(int(x) for x in grid)
-            shape = tuple(features.shape[1:])
-            if task == "segmentation" and patches.shape[1] != grid[0] * grid[1]:
-                raise ValueError("Spatial tokens must match the returned grid.")
-            if feature_array is None:
-                feature_shape = (len(dataset), views, *shape)
-                target_shape = (len(dataset), *targets.shape[1:])
-                target_dtype = np.int64 if task == "classification" else np.uint8
-                required = (int(np.prod(feature_shape)) * 4 +
-                            int(np.prod(target_shape)) * np.dtype(target_dtype).itemsize)
-                free = shutil.disk_usage(directory).free
-                if free < required + 2 * 2**30:
-                    raise RuntimeError(
-                        f"Cache needs {required / 2**30:.1f} GiB plus 2 GiB free; "
-                        f"only {free / 2**30:.1f} GiB available. Choose another CACHE_ROOT."
-                    )
-                print(f"  {part} cache: {required / 2**30:.2f} GiB; float32")
-                feature_array = np.lib.format.open_memmap(
-                    directory / "features.npy", mode="w+", dtype=np.float32,
-                    shape=feature_shape)
-                target_array = np.lib.format.open_memmap(
-                    directory / "targets.npy", mode="w+", dtype=target_dtype,
-                    shape=target_shape)
-                meta.update(grid=list(grid), feature_shape=list(shape), bytes=required)
-            if list(grid) != meta["grid"] or list(shape) != meta["feature_shape"]:
-                raise ValueError("Cache requires a fixed feature grid and feature dimension.")
-            end = offset + images.shape[0]
-            feature_array[offset:end, 0] = features.cpu().numpy()
-            target_array[offset:end] = targets.numpy()
-            if views == 2:
-                flipped_patches, flipped_grid = model.backbone(images.flip(-1))
-                flipped = _cache_features(flipped_patches, task)
-                if tuple(flipped.shape) != tuple(features.shape) or tuple(flipped_grid) != grid:
-                    raise ValueError("Flipped features changed shape.")
-                feature_array[offset:end, 1] = flipped.cpu().numpy()
-                del flipped, flipped_patches
-            offset = end
-            del images, patches, features, targets
-        if offset != len(dataset) or feature_array is None:
-            raise RuntimeError("Cache image count mismatch.")
-        feature_array.flush()
-        target_array.flush()
-        if is_cuda:
-            torch.cuda.synchronize(device)
-        meta.update(complete=True, seconds=time.perf_counter() - start,
-                    backbone_image_forwards=offset * views,
-                    peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30 if is_cuda else 0.0,
-                    peak_reserved_gib=torch.cuda.max_memory_reserved(device) / 2**30 if is_cuda else 0.0)
-        write_json(directory / "cache.json", meta)
-    finally:
-        for array in (feature_array, target_array):
-            if array is not None:
-                array._mmap.close()
-    return meta
-
-
 class _Runner:
+
+
     def __init__(self, model_factory, config):
         self.model_factory = model_factory
         self.c = dict(config)
@@ -1286,6 +834,7 @@ class _Runner:
             "classification": config["SPLIT_ROOT"] / "imagenet_split.json",
             "segmentation": config["SPLIT_ROOT"] / "ade20k_split.json",
         }
+
 
     def prepare(self):
         c = self.c
@@ -1348,70 +897,45 @@ class _Runner:
                         if part != "val" and Path(rel).parent.name not in self.class_to_idx:
                             raise ValueError(f"Unknown training class: {rel}")
             print(task, {p: len(split[f"{p}_files"]) for p in ("train", "dev", "val")})
-        self.out = self.root / "report 1"/ "baseline measurments" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.out = self.root / "report_2" / "cropr measurements" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.out.mkdir(parents=True, exist_ok=False)
-        write_json(self.out / "configuration.json", {
-            "training_mode": c["TRAINING_MODE"],
-            "cache_dtype": "float32" if c["TRAINING_MODE"] == "cached_head" else None,
-            "lora": {"rank": c["LORA_R"], "alpha": c["LORA_ALPHA"], "lr": c["LORA_LR"],
-                     "targets": c["LORA_TARGETS"], "dropout": 0.0,
-                     "unwrap_backbone_forward": c["LORA_UNWRAP_BACKBONE_FORWARD"]},
-            "max_grad_norm": c["MAX_GRAD_NORM"] if math.isfinite(c["MAX_GRAD_NORM"]) else None,
-            "strict_determinism": c["STRICT_DETERMINISM"],
-            "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "cache_root": str(c["CACHE_ROOT"]), "cache_batch_size": c["CACHE_BATCH_SIZE"],
-            "keep_cache": c["KEEP_CACHE"], "cached_loader_workers": 0,
-            "training_seconds_scope": ("train feature extraction + cached head epochs" if c["TRAINING_MODE"] == "cached_head" else "uncached RGB adapter + head training"),
-            "seed": c["SEED"], "input_size": c["SIZE"], "batch_size": c["BATCH_SIZE"],
-            "micro_batch_size": c["MICRO_BATCH_SIZE"], "grad_accum_steps": c["GRAD_ACCUM_STEPS"],
+        configuration = {
+            "training_mode": "cropr", "seed": c["SEED"], "input_size": c["SIZE"],
+            "batch_size": c["BATCH_SIZE"], "micro_batch_size": c["MICRO_BATCH_SIZE"],
+            "grad_accum_steps": c["GRAD_ACCUM_STEPS"], "eval_batch_size": c["EVAL_BATCH_SIZE"],
             "effective_train_batch_size": c["MICRO_BATCH_SIZE"] * c["GRAD_ACCUM_STEPS"],
-            "eval_batch_size": c["EVAL_BATCH_SIZE"],
-            "batch_size_scope": "inference benchmark; LoRA training uses micro_batch_size",
-            "accumulation_loss_normalization": "total valid targets per window, including final partial window",
-            "epochs": c["EPOCHS"], "learning_rates": c["LR"],
-            "weight_decay": c["WEIGHT_DECAY"], "optimizer": "AdamW",
-            "scheduler": "CosineAnnealingLR", "precision": "inference float32; TF32 disabled",
+            "epochs": c["EPOCHS"], "learning_rates": c["LR"], "weight_decay": c["WEIGHT_DECAY"],
+            "cropr_variant": c["VARIANT"], "pruning_rate": c["PRUNING_RATE"],
+            "cropr_lr": c["CROPR_LR"], "aux_weight": c["AUX_WEIGHT"],
+            "num_heads": c["NUM_HEADS"], "strict_determinism": c["STRICT_DETERMINISM"],
+            "max_grad_norm": c["MAX_GRAD_NORM"] if math.isfinite(c["MAX_GRAD_NORM"]) else None,
+            "optimizer": "AdamW", "scheduler": "CosineAnnealingLR",
             "train_precision": c["TRAIN_PRECISION"], "evaluation_precision": "fp32",
-            "evaluation_tf32": c.get("EVAL_TF32", False),
-            "compile_lora": c.get("COMPILE_LORA", False),
-            "compile_backend": c.get("COMPILE_BACKEND", "inductor"),
-            "compile_mode": c.get("COMPILE_MODE", "default"),
-            "benchmark_precision": "fp32", "training_profile_precision": c["TRAIN_PRECISION"],
-            "loader_backend": c["LOADER_BACKEND"], "fail_fast": c["FAIL_FAST"],
-            "frozen_backbones": c["TRAINING_MODE"] == "cached_head",
-            "pretrained_parameters_frozen": True,
+            "evaluation_tf32": c["EVAL_TF32"], "benchmark_precision": "fp32; TF32 disabled",
+            "training_seconds_scope": "RGB loading + main/auxiliary forward/backward + optimizer; excludes dev and audits",
+            "accumulation_loss_normalization": "main and auxiliary losses each normalized by actual valid targets per window",
+            "pretrained_parameters_frozen": True, "cache_enabled": False,
             "augmentation": f"resize to {c['SIZE']}x{c['SIZE']}; training horizontal flip p=0.5",
             "segmentation_evaluation": f"{c['SIZE']}x{c['SIZE']} masks, 150 classes, ignore label 255",
-            "classification_head": "mean patch pooling + linear",
-            "segmentation_head": "1x1 conv + GN + GELU + 3x3 conv + GN + GELU + 1x1 conv",
             "heldout_split": "official validation; used after dev-based selection",
-            "imagenet_heldout_labels": "LOC_val_solution.csv, unique synset validated",
-            "split_sha256": {t: hashlib.sha256(p.read_bytes()).hexdigest()
-                             for t, p in self.split_paths.items()},
-            "split_sizes": {t: {p: len(s[f'{p}_files']) for p in ('train', 'dev', 'val')}
-                            for t, s in self.splits.items()},
-            "gpu": torch.cuda.get_device_name(self.device),
-            "gpu_total_gib": torch.cuda.get_device_properties(self.device).total_memory / 2**30,
-            "torch": torch.__version__, "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
+            "split_sha256": {t: hashlib.sha256(p.read_bytes()).hexdigest() for t,p in self.split_paths.items()},
+            "split_sizes": {t: {p: len(s[f'{p}_files']) for p in ('train','dev','val')} for t,s in self.splits.items()},
+            "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "cropr_sha256": hashlib.sha256(Path(cropr_module.__file__).read_bytes()).hexdigest(),
+            "gpu": torch.cuda.get_device_name(self.device), "torch": str(torch.__version__),
+            "cuda": torch.version.cuda, "python": platform.python_version(),
             **{p: package_version(p) for p in ("torchvision", "transformers", "timm")},
-            "python": platform.python_version(), "num_workers": c["NUM_WORKERS"],
-            "multiprocessing_context": "spawn" if c["NUM_WORKERS"] and c["LOADER_BACKEND"] == "process" else None,
-            "persistent_workers": False,
-            "flop_batches": c["FLOP_BATCHES"], "bench_trials": c["BENCH_TRIALS"],
-            "whole_model_flops_convention": "dense_matmul_conv_2_flops_per_mac",
-            "flops_counter_version": 3,
+            "loader_backend": c["LOADER_BACKEND"], "num_workers": c["NUM_WORKERS"],
+            "model_names": c["MODEL_NAMES"], "tasks": c["TASKS"],
             "bench_warmup": c["BENCH_WARMUP"], "bench_repeats": c["BENCH_REPEATS"],
-            "profile_repeats": c["PROFILE_REPEATS"], "model_names": c["MODEL_NAMES"],
-            "tasks": c["TASKS"], "cache_validation_version": 2,
-            "attention_module_names": c["ATTENTION_MODULE_NAMES"],
-            "attention_flops_convention": "dense_matmul_2_flops_per_mac",
-        })
-        print("\nGPU:", torch.cuda.get_device_name(self.device))
+            "bench_trials": c["BENCH_TRIALS"], "flop_batches": c["FLOP_BATCHES"],
+            "profile_repeats": c["PROFILE_REPEATS"], "whole_model_flops_convention": "dense_matmul_conv_2_flops_per_mac",
+            "flops_counter_version": 3, "attention_module_names": c["ATTENTION_MODULE_NAMES"],
+        }
+        write_json(self.out / "configuration.json", configuration)
         print("Results:", self.out)
-        print("Training precision:", c["TRAIN_PRECISION"], "| evaluation TF32:", c.get("EVAL_TF32", False),
-              "| benchmarks: fp32, TF32 disabled")
-        print("Image loader:", c["LOADER_BACKEND"], "| workers:", c["NUM_WORKERS"])
+        print("Cropr variant:", c["VARIANT"], "| precision:", c["TRAIN_PRECISION"])
+
 
     def make_loader(self, task, part):
         c = self.c
@@ -1420,7 +944,7 @@ class _Runner:
             c["SIZE"], self.class_to_idx if task == "classification" else {},
             self.val_labels if task == "classification" and part == "val" else {},
         )
-        batch_size = (c["MICRO_BATCH_SIZE"] if part == "train" else c["EVAL_BATCH_SIZE"]) if c["TRAINING_MODE"] == "lora" else c["BATCH_SIZE"]
+        batch_size = (c["MICRO_BATCH_SIZE"] if part == "train" else c["EVAL_BATCH_SIZE"]) if c["TRAINING_MODE"] == "cropr" else c["BATCH_SIZE"]
         if c["NUM_WORKERS"] and c.get("LOADER_BACKEND", "process") == "thread":
             return ThreadedImageLoader(dataset, batch_size, c["NUM_WORKERS"],
                                        part == "train", c["SEED"])
@@ -1432,9 +956,11 @@ class _Runner:
             worker_init_fn=seed_worker, persistent_workers=False, **worker_args,
         )
 
+
     def training_autocast(self):
         return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16,
                               enabled=self.c.get("TRAIN_PRECISION", "fp32") == "bf16")
+
 
     @torch.inference_mode()
     def evaluate(self, model, loader, task):
@@ -1476,6 +1002,7 @@ class _Runner:
                 classes_with_nonzero_union=int(present.sum().item()),
             )
         return result
+
 
     @torch.inference_mode()
     def benchmark(self, model, images, task, directory=None):
@@ -1546,7 +1073,8 @@ class _Runner:
             })
         return result
 
-    def profile_model(self, model, images, target, task, directory, profile_backward=True):
+
+    def profile_model(self, model, images, target, task, directory, profile_backward=False):
         repeats = self.c["PROFILE_REPEATS"]
         model.eval()
         with component_labels(model, task) as matched:
@@ -1561,22 +1089,6 @@ class _Runner:
         averages = prof.key_averages()
         result = _component_time_summary(prof, matched)
         result["forward_partial_gflops_per_image"] = sum(float(e.flops or 0) for e in averages) / repeats / images.shape[0] / 1e9
-        if profile_backward:
-            model.train()
-            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                         record_shapes=True, with_flops=True) as train_prof:
-                for _ in range(repeats):
-                    model.zero_grad(set_to_none=True)
-                    with record_function("training/forward_and_head_backward"):
-                        with self.training_autocast():
-                            logits = model(images, task)
-                        loss_sum, count = loss_sum_and_count(logits.float(), target, task)
-                        (loss_sum / max(count, 1)).backward()
-                torch.cuda.synchronize()
-            train_prof.export_chrome_trace(str(directory / "training_trace.json"))
-            result["forward_backward_partial_gflops_per_image"] = sum(float(e.flops or 0) for e in train_prof.key_averages()) / repeats / images.shape[0] / 1e9
-            model.zero_grad(set_to_none=True)
-            model.eval()
         write_json(directory / "profiling.json", {
             **result, "matched_modules": matched, "batch_size": images.shape[0],
             "notes": [
@@ -1584,588 +1096,12 @@ class _Runner:
                 "Attention includes QKV/output projections inside attention modules.",
                 "Profiler overhead is excluded from benchmark speed measurements.",
                 "FLOPs are partial supported-operation estimates, not total compute.",
-                "Training trace scope is recorded separately for LoRA; frozen mode profiles head backward only.",
+                "Training trace includes Cropr auxiliary loss and task head backward.",
                 "Inference benchmark excludes loading, preprocessing and host-to-device transfer.",
             ],
         })
         return result
 
-    def run_lora_experiment(self, name, task):
-        c = self.c
-        experiment_start = time.perf_counter()
-        seed_everything(c['SEED'])
-        gc.collect()
-        torch.cuda.empty_cache()
-        directory = self.out / f'{task}_{name}'
-        directory.mkdir()
-        loaders = {p: self.make_loader(task, p) for p in ('train', 'dev', 'val')}
-        with loader_timer("Checking image loader before model allocation"), first_batch_progress(loaders['dev']) as (progress, per_image):
-            probe_iterator = iter(loaders['dev'])
-            try:
-                with loader_timer("Loading first dev batch"):
-                    check_images, check_target = next(probe_iterator)
-                    if not per_image:
-                        progress.update(1)
-            finally:
-                with loader_timer("Closing image loader check"):
-                    if hasattr(probe_iterator, "close"):
-                        probe_iterator.close()
-                    del probe_iterator
-        model = self.model_factory(name)
-        inactive = 'segmentation' if task == 'classification' else 'classification'
-        setattr(model, f'{inactive}_head', nn.Identity())
-        model = model.to(self.device).eval()
-        head = getattr(model, f'{task}_head')
-        head.requires_grad_(True)
-        base_hash = _frozen_backbone_digest(model.backbone)
-        if len(loaders['dev'].dataset) < c['BATCH_SIZE']:
-            raise ValueError('Dev split must contain one full benchmark batch.')
-        probe = check_images[:1].to(self.device)
-        with torch.no_grad():
-            initial = model(probe, task)
-        expected = ((len(probe), 1000) if task == 'classification' else
-                    (len(probe), 150, c['SIZE'], c['SIZE']))
-        if tuple(initial.shape) != expected:
-            raise ValueError(f'Unexpected model output: {initial.shape}; expected {expected}')
-        spec = inject_lora(model, rank=c['LORA_R'], alpha=c['LORA_ALPHA'],
-                           targets=c['LORA_TARGETS'].get(name),
-                           unwrap_backbone_forward=c['LORA_UNWRAP_BACKBONE_FORWARD'])
-        adapters = [p for p in model.backbone.parameters() if p.requires_grad]
-        parameters = list(head.parameters()) + adapters
-        allowed = {id(p) for p in parameters}
-        if {id(p) for p in model.parameters() if p.requires_grad} != allowed:
-            raise RuntimeError('Unexpected trainable parameters outside adapters and active head.')
-        model.eval()
-        with torch.no_grad():
-            torch.testing.assert_close(model(probe, task), initial, rtol=0, atol=0)
-        # A synthetic scalar checks connectivity even for all-ignore ADE masks.
-        # B starts at zero: A's gradient may be zero, but must not be absent.
-        model.zero_grad(set_to_none=True)
-        with self.training_autocast():
-            output = model(probe, task)
-        if not output.requires_grad:
-            raise RuntimeError('Model forward is under no_grad/inference_mode; LoRA cannot train.')
-        output.float().square().mean().backward()
-        disconnected = [f'{n}.{key}' for n, m in _lora_modules(model.backbone).items()
-                        for key in ('lora_A', 'lora_B') if getattr(m, key).grad is None]
-        if disconnected:
-            raise RuntimeError(f'LoRA gradients disconnected: {disconnected}.  A nested no_grad, detach, or unused projection blocks training.')
-        _check_gradients(model, parameters, c['MAX_GRAD_NORM'])
-        if not any(torch.count_nonzero(m.lora_B.grad).item() for m in _lora_modules(model.backbone).values()):
-            raise RuntimeError('All initial LoRA B gradients are zero; refusing silent head-only training.')
-        model.zero_grad(set_to_none=True)
-        del output, initial, probe
-        if _frozen_backbone_digest(model.backbone) != base_hash:
-            raise RuntimeError('Pretrained state changed during adapter setup.')
-        write_json(directory / 'lora_setup.json', {**spec, 'pretrained_backbone_sha256': base_hash,
-                   'initial_output_equivalence': True, 'gradient_connectivity': True,
-                   'cache_enabled': False, 'backbone_eval_mode': True})
-        initial_adapters = _adapter_state(model.backbone)
-        optimizer = torch.optim.AdamW([
-            {'params': list(head.parameters()), 'lr': c['LR'][task], 'name': 'head'},
-            {'params': adapters, 'lr': c['LORA_LR'], 'name': 'lora'},
-        ], weight_decay=c['WEIGHT_DECAY'])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=c['EPOCHS'][task])
-        metric = 'top1_pct' if task == 'classification' else 'miou_pct'
-        best_score, best_epoch = -float('inf'), None
-        history = []
-        total_steps = total_images = 0
-        fit_start = time.perf_counter()
-        training_forward = _LoRATrainingForward(
-            model, c.get('COMPILE_LORA', False), c.get('COMPILE_BACKEND', 'inductor'),
-            c.get('COMPILE_MODE', 'default'), directory / 'compile_status.json')
-        for epoch in range(1, c['EPOCHS'][task] + 1):
-            seed_everything(c['SEED'] + epoch)
-            loaders['train'].generator.manual_seed(c['SEED'] + epoch)
-            model.train()
-            model.backbone.eval()  # eval controls stochastic layers, not autograd.
-            head.train()
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            started = time.perf_counter()
-            loss_total = count_total = epoch_images = epoch_steps = 0
-            max_grad_norm = 0.0
-            window_count = window_batches = 0
-            # A fixed denominator keeps backward magnitudes modest.  At the
-            # update boundary rescale by the ACTUAL number of valid targets.
-            normalizer = c['MICRO_BATCH_SIZE'] * c['GRAD_ACCUM_STEPS']
-            if task == 'segmentation':
-                normalizer *= c['SIZE'] ** 2
-            optimizer.zero_grad(set_to_none=True)
-            for images, target in timed_image_batches(loaders['train'], f'{task}/{name} LoRA epoch {epoch}'):
-                images = images.to(self.device, non_blocking=True)
-                target = target.to(self.device, non_blocking=True)
-                logits, loss_sum, count = training_forward.backward(
-                    images, target, task, normalizer, self.training_autocast)
-                window_count += count
-                window_batches += 1
-                loss_total += loss_sum.detach().item()
-                count_total += count
-                epoch_images += len(images)
-                # Release the previous graph/logits before the next forward.
-                del logits, loss_sum, images, target
-                if window_batches == c['GRAD_ACCUM_STEPS']:
-                    if window_count:
-                        norm = _finish_accumulated_step(model, optimizer, parameters,
-                                                       normalizer, window_count, c['MAX_GRAD_NORM'])
-                        max_grad_norm = max(max_grad_norm, norm)
-                        epoch_steps += 1
-                    else:
-                        optimizer.zero_grad(set_to_none=True)
-                    window_count = window_batches = 0
-            # Flush the last short window; all-ignore windows have no update.
-            if window_count:
-                norm = _finish_accumulated_step(model, optimizer, parameters,
-                                               normalizer, window_count, c['MAX_GRAD_NORM'])
-                max_grad_norm = max(max_grad_norm, norm)
-                epoch_steps += 1
-            torch.cuda.synchronize()
-            train_seconds = time.perf_counter() - started
-            allocated = torch.cuda.max_memory_allocated() / 2**30
-            reserved = torch.cuda.max_memory_reserved() / 2**30
-            if not count_total or not epoch_steps:
-                raise RuntimeError('No valid training targets/optimizer steps.')
-            optimizer.zero_grad(set_to_none=True)
-            if _frozen_backbone_digest(model.backbone) != base_hash:
-                raise RuntimeError('Frozen pretrained parameters or buffers changed during training.')
-            current_adapters = _adapter_state(model.backbone)
-            if not any(not torch.equal(v, initial_adapters[k]) for k, v in current_adapters.items()):
-                raise RuntimeError('Adapters did not change; refusing silent head-only training.')
-            total_steps += epoch_steps
-            total_images += epoch_images
-            started = time.perf_counter()
-            dev = self.evaluate(model, loaders['dev'], task)
-            dev_seconds = time.perf_counter() - started
-            row = {'training_mode': 'lora', 'train_precision': c['TRAIN_PRECISION'], 'evaluation_precision': 'fp32', 'epoch': epoch,
-                   'compile_active': training_forward.info['active'], 'evaluation_tf32': c.get('EVAL_TF32', False),
-                   'lr': optimizer.param_groups[0]['lr'], 'lora_lr': optimizer.param_groups[1]['lr'],
-                   'train_loss': loss_total / count_total, 'train_seconds': train_seconds,
-                   'train_images_per_second': epoch_images / train_seconds,
-                   'train_images': epoch_images, 'optimizer_steps': epoch_steps,
-                   'micro_batch_size': c['MICRO_BATCH_SIZE'], 'grad_accum_steps': c['GRAD_ACCUM_STEPS'],
-                   'effective_train_batch_size': c['MICRO_BATCH_SIZE'] * c['GRAD_ACCUM_STEPS'],
-                   'train_peak_allocated_gib': allocated, 'train_peak_reserved_gib': reserved,
-                   'max_preclip_grad_norm': max_grad_norm, 'dev_seconds': dev_seconds,
-                   **{f'dev_{k}': v for k, v in dev.items()}}
-            history.append(row)
-            write_csv(directory / 'epochs.csv', history)
-            checkpoint = {'model_name': name, 'task': task, 'epoch': epoch,
-                          'compile_options': dict(training_forward.info),
-                          'evaluation_tf32': c.get('EVAL_TF32', False),
-                          'feature_dim': model.backbone.feature_dim, 'input_size': c['SIZE'],
-                          'head_state_dict': {k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
-                          'lora_state_dict': current_adapters, 'lora': spec,
-                          'pretrained_backbone_sha256': base_hash, 'training_mode': 'lora', 'train_precision': c['TRAIN_PRECISION'], 'evaluation_precision': 'fp32',
-                          'dev_metrics': dev, 'seed': c['SEED'], 'checkpoint_format_version': 1,
-                          'resume_supported': False}
-            atomic_torch_save(checkpoint, directory / 'last_lora.pt')
-            if dev[metric] > best_score:
-                best_score, best_epoch = dev[metric], epoch
-                atomic_torch_save(checkpoint, directory / 'best_lora.pt')
-            scheduler.step()
-            print(f"  train loss={row['train_loss']:.4f} | dev {metric}={dev[metric]:.2f} | train={train_seconds / 60:.1f} min | peak={allocated:.2f} GiB")
-        fit_seconds = time.perf_counter() - fit_start
-        training_forward.record()
-        compile_options = dict(training_forward.info)
-        del training_forward
-        optimizer.zero_grad(set_to_none=True)
-        del optimizer, scheduler, parameters, adapters
-        if 'loss' in locals():
-            del loss
-        checkpoint = torch.load(directory / 'best_lora.pt', map_location='cpu', weights_only=True)
-        head.load_state_dict(checkpoint['head_state_dict'])
-        _load_adapter_state(model.backbone, checkpoint['lora_state_dict'])
-        # Training profiling uses the training microbatch, never the inference batch.
-        profile_images, profile_target = next(iter(loaders['train']))
-        images = profile_images.to(self.device)
-        target = profile_target.to(self.device)
-        del profile_images, profile_target
-        # Profile adaptation before merging, so backward includes the adapters.
-        compute = {}
-        try:
-            compute.update(self.profile_lora_training(model, images, target, task, directory))
-        except Exception as exc:
-            compute['training_profiling_error'] = str(exc)
-            (directory / 'training_profiling_error.txt').write_text(traceback.format_exc(), encoding='utf-8')
-        finally:
-            model.zero_grad(set_to_none=True)
-            model.eval()
-        del images, target
-        # Keep the merge audit at one image; segmentation logits can be large.
-        images = check_images[:1].to(self.device)
-        with torch.no_grad():
-            before = model(images, task)
-        merge_lora(model)
-        with torch.no_grad():
-            after = model(images, task)
-            if not torch.isfinite(before).all() or not torch.isfinite(after).all():
-                raise RuntimeError("Non-finite outputs during LoRA merge validation.")
-
-            torch.testing.assert_close(after, before, rtol=1e-4, atol=1e-3)
-            merge_error = float((after - before).abs().max())
-        write_json(directory / 'lora_merge_validation.json', {
-            'passed': True, 'max_absolute_logit_error': merge_error,
-            'rtol': 1e-4, 'atol': 1e-3, 'images_checked': len(images),
-            'note': 'Dev-batch numerical check; held-out metrics use merged model.'})
-        del before, after, checkpoint, current_adapters, initial_adapters
-        model.zero_grad(set_to_none=True)
-        gc.collect()
-        torch.cuda.empty_cache()
-        started = time.perf_counter()
-        heldout = self.evaluate(model, loaders['val'], task)
-        test_seconds = time.perf_counter() - started
-        del images
-        benchmark_samples = [loaders['dev'].dataset[i] for i in range(c['BATCH_SIZE'])]
-        images = torch.stack([sample[0] for sample in benchmark_samples]).to(self.device)
-        target = torch.stack([torch.as_tensor(sample[1]) for sample in benchmark_samples]).to(self.device)
-        del benchmark_samples
-        speed = self.benchmark(model, images, task, directory)
-        try:
-            compute.update(measure_flops_on_dataset(
-                model, loaders['dev'].dataset, task, c['BATCH_SIZE'], c['FLOP_BATCHES'],
-                c['SEED'], directory, module_names=c['ATTENTION_MODULE_NAMES'].get(name)))
-        except Exception as exc:
-            compute.update(whole_model_flops_coverage_ok=False, whole_model_forward_gflops_per_image=None,
-                           attention_flops_coverage_ok=False, attention_forward_gflops_per_image=None,
-                           flops_error=str(exc))
-            (directory / 'attention_flops_error.txt').write_text(traceback.format_exc(), encoding='utf-8')
-        try:
-            compute.update(self.profile_model(model, images, target, task, directory, profile_backward=False))
-        except Exception as exc:
-            compute['profiling_error'] = str(exc)
-            (directory / 'profiling_error.txt').write_text(traceback.format_exc(), encoding='utf-8')
-        profiling_path = directory / 'profiling.json'
-        profiling = json.loads(profiling_path.read_text(encoding='utf-8')) if profiling_path.exists() else {}
-        write_json(profiling_path, {**profiling, **compute, 'inference_lora_merged': True,
-                                   'profile_training_scope': 'unmerged RGB forward + adapter/head backward; no optimizer'})
-        result = {'model': name, 'task': task, 'status': 'completed', 'seed': c['SEED'],
-                  'compile_options': compile_options, 'evaluation_tf32': c.get('EVAL_TF32', False),
-                  'resolution': c['SIZE'], 'batch_size': c['BATCH_SIZE'], 'epochs': c['EPOCHS'][task],
-                  'micro_batch_size': c['MICRO_BATCH_SIZE'], 'grad_accum_steps': c['GRAD_ACCUM_STEPS'],
-                  'effective_train_batch_size': c['MICRO_BATCH_SIZE'] * c['GRAD_ACCUM_STEPS'],
-                  'eval_batch_size': c['EVAL_BATCH_SIZE'],
-                  'best_epoch': best_epoch, 'best_dev_metric': best_score, 'selection_metric': metric,
-                  'training_mode': 'lora', 'train_precision': c['TRAIN_PRECISION'], 'evaluation_precision': 'fp32', 'cache_enabled': False, 'inference_lora_merged': True,
-                  'lora_rank': spec['rank'], 'lora_alpha': spec['alpha'], 'lora_lr': c['LORA_LR'],
-                  'trainable_lora_parameters': spec['trainable_parameters'],
-                  'backbone_parameters': sum(p.numel() for p in model.backbone.parameters()),
-                  'trainable_head_parameters': sum(p.numel() for p in head.parameters()),
-                  'total_training_images': total_images, 'total_optimizer_steps': total_steps,
-                  'training_seconds': sum(r['train_seconds'] for r in history),
-                  'training_seconds_scope': 'RGB loading + forward + adapter/head backward + optimizer; excludes dev and safety audits',
-                  'fit_seconds_including_dev_and_saves': fit_seconds,
-                  'heldout_evaluation_seconds': test_seconds,
-                  'train_peak_allocated_gib': max(r['train_peak_allocated_gib'] for r in history),
-                  'train_peak_reserved_gib': max(r['train_peak_reserved_gib'] for r in history),
-                  'inference_scope': 'merged full RGB model; no feature cache',
-                  'profile_training_scope': 'unmerged RGB forward + adapter/head backward; no optimizer',
-                  'pretrained_backbone_sha256': base_hash, 'frozen_state_verified': True,
-                  'merge_max_absolute_logit_error': merge_error,
-                  'best_checkpoint_path': str(directory / 'best_lora.pt'),
-                  'experiment_seconds_including_measurements': time.perf_counter() - experiment_start,
-                  **{f'heldout_{k}': v for k, v in heldout.items()}, **speed, **compute}
-        write_json(directory / 'result.json', result)
-        return result
-
-    def profile_lora_training(self, model, images, target, task, directory):
-        repeats = self.c['PROFILE_REPEATS']
-        model.train()
-        model.backbone.eval()
-        try:
-            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                         record_shapes=True, with_flops=True) as prof:
-                for _ in range(repeats):
-                    model.zero_grad(set_to_none=True)
-                    with record_function('training/forward_and_lora_head_backward'):
-                        with self.training_autocast():
-                            logits = model(images, task)
-                        loss, count = loss_sum_and_count(logits.float(), target, task)
-                        if not count:
-                            raise ValueError('No valid labels in training profile batch.')
-                        (loss / count).backward()
-                torch.cuda.synchronize()
-            prof.export_chrome_trace(str(directory / 'training_trace.json'))
-            return {'forward_backward_partial_gflops_per_image':
-                    sum(float(e.flops or 0) for e in prof.key_averages()) / repeats / len(images) / 1e9,
-                    'training_profile_lora_merged': False,
-                    'training_profile_precision': self.c.get('TRAIN_PRECISION', 'fp32'),
-                    'training_profile_batch_size': len(images)}
-        finally:
-            model.zero_grad(set_to_none=True)
-            model.eval()
-
-    def run_experiment(self, name, task):
-        if self.c["TRAINING_MODE"] == "lora":
-            return self.run_lora_experiment(name, task)
-        c = self.c
-        experiment_start = time.perf_counter()
-        seed_everything(c["SEED"])
-        gc.collect()
-        torch.cuda.empty_cache()
-        directory = self.out / f"{task}_{name}"
-        directory.mkdir()
-        loaders = {p: self.make_loader(task, p) for p in ("train", "dev", "val")}
-        model = self.model_factory(name)
-        inactive = "segmentation" if task == "classification" else "classification"
-        setattr(model, f"{inactive}_head", nn.Identity())
-        model = model.to(self.device)
-        head = getattr(model, f"{task}_head")
-        if any(p.requires_grad for p in model.backbone.parameters()):
-            raise RuntimeError("Cached-head mode requires an entirely frozen backbone.")
-        optimizer = torch.optim.AdamW(head.parameters(), lr=c["LR"][task], weight_decay=c["WEIGHT_DECAY"])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=c["EPOCHS"][task])
-        check_images, check_target = next(iter(loaders["dev"]))
-        model.eval()
-        with torch.no_grad():
-            check_logits = model(check_images[:1].to(self.device), task)
-        expected = (1, 1000) if task == "classification" else (1, 150, c["SIZE"], c["SIZE"])
-        if tuple(check_logits.shape) != expected:
-            raise ValueError(f"{name}: output {tuple(check_logits.shape)} != expected {expected}")
-        del check_logits
-        # Validate the cached-head interface and both input orientations before
-        # spending time creating large caches. Trainable heads may not pool
-        # tokens differently from the original notebook's ClassificationHead.
-        cache_validation = []
-        for flip in (False, True):
-            x = check_images[:2].to(self.device)
-            if flip:
-                x = x.flip(-1)
-            with torch.no_grad():
-                patches, grid = model.backbone(x)
-                features = _cache_features(patches, task)
-                cached_model = _HeadFromCache(head, task, grid, c["SIZE"])
-                cached_model.eval()
-                try:
-                    _validate_cache_tensor(
-                        cached_model(features, task), model(x, task),
-                        label=f"head_interface_flip_{flip}", report=cache_validation)
-                finally:
-                    write_json(directory / "cache_validation.json", cache_validation)
-            del x, patches, features
-        raw_dev_dataset = loaders["dev"].dataset
-        cache_dir = c["CACHE_ROOT"] / self.out.name / f"{task}_{name}"
-        cache_dir.mkdir(parents=True, exist_ok=False)
-        cache_stats = {}
-        for part in ("train", "dev"):
-            # Using 'dev' disables random flips; train/dev labels both come
-            # from ImageNet class folders. Extraction is sequential.
-            raw_dataset = SavedSplitDataset(
-                task, "dev", self.splits[task][f"{part}_files"],
-                self.roots[task], c["SIZE"], self.class_to_idx, {})
-            cache_stats[part] = build_feature_cache(
-                model, raw_dataset, task, part, cache_dir / part,
-                device=self.device, batch_size=c["CACHE_BATCH_SIZE"],
-                num_workers=c["NUM_WORKERS"], seed=c["SEED"],
-                loader_backend=c["LOADER_BACKEND"])
-            if tuple(cache_stats[part]["grid"]) != tuple(grid):
-                raise ValueError("Extraction grid differs from shape-check grid.")
-            dataset = CachedFeatureDataset(cache_dir / part, training=part == "train")
-            loaders[part] = DataLoader(
-                dataset, batch_size=c["BATCH_SIZE"], shuffle=part == "train",
-                num_workers=0, pin_memory=True, drop_last=False,
-                generator=torch.Generator().manual_seed(c["SEED"]))
-        write_json(directory / "feature_cache.json", {
-            "path": str(cache_dir), "parts": cache_stats,
-            "cache_policy": "fresh per experiment; no cross-run reuse",
-            "keep_cache": c["KEEP_CACHE"],
-            "note": "Caching preserves both horizontal views, not bitwise GPU reproducibility."})
-        # Replay the FIRST extraction batch at its original batch size. GPU
-        # kernels can round differently when extraction uses B images but the
-        # replay uses only two. Check stored FEATURES before checking the head.
-        replay_loader = DataLoader(
-            raw_dev_dataset, batch_size=c["CACHE_BATCH_SIZE"], shuffle=False,
-            num_workers=0, generator=torch.Generator().manual_seed(c["SEED"]))
-        replay_images, replay_targets = next(iter(replay_loader))
-        ncheck = min(2, len(replay_images))
-        stored = [loaders["dev"].dataset[i] for i in range(ncheck)]
-        cached_x = torch.stack([item[0] for item in stored]).to(self.device)
-        cached_y = torch.stack([torch.as_tensor(item[1]) for item in stored])
-        try:
-            with torch.no_grad():
-                torch.testing.assert_close(cached_y, replay_targets[:ncheck], rtol=0, atol=0)
-                replay_patches, replay_grid = model.backbone(replay_images.to(self.device))
-                if tuple(replay_grid) != tuple(grid):
-                    raise RuntimeError("Disk cache grid mismatch.")
-                expected_features = _cache_features(replay_patches, task)[:ncheck].contiguous()
-                _validate_cache_tensor(
-                    cached_x, expected_features, label="disk_features_matched_batch",
-                    report=cache_validation, atol=1e-5)
-                _validate_cache_tensor(
-                    cached_model(cached_x, task), cached_model(expected_features, task),
-                    label="disk_head_matched_batch", report=cache_validation)
-        finally:
-            write_json(directory / "cache_validation.json", cache_validation)
-        del cached_x, cached_y, stored, replay_images, replay_targets
-        del replay_patches, expected_features, replay_loader
-        metric = "top1_pct" if task == "classification" else "miou_pct"
-        best_score, best_epoch = -float("inf"), None
-        history = []
-        total_steps = total_images = 0
-        fit_start = time.perf_counter()
-        for epoch in range(1, c["EPOCHS"][task] + 1):
-            seed_everything(c["SEED"] + epoch)
-            # Explicitly seed sampler and worker augmentation for each epoch.
-            loaders["train"].generator.manual_seed(c["SEED"] + epoch)
-            cached_model.train()
-            if model.backbone.training:
-                raise RuntimeError("Cached-head backbone must remain in evaluation mode.")
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            start = time.perf_counter()
-            loss_total = count_total = epoch_images = epoch_steps = 0
-            progress = tqdm(loaders["train"], desc=f"{task} | {name} | epoch {epoch}/{c['EPOCHS'][task]}")
-            for images, target in progress:
-                images = images.to(self.device, non_blocking=True)
-                target = target.to(self.device, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                with self.training_autocast():
-                    logits = cached_model(images, task)
-                loss_sum, count = loss_sum_and_count(logits.float(), target, task)
-                if count:
-                    loss = loss_sum / count
-                    if not torch.isfinite(loss):
-                        raise RuntimeError("Non-finite training loss.")
-                    loss.backward()
-                    _check_gradients(model, list(head.parameters()), c["MAX_GRAD_NORM"])
-                    optimizer.step()
-                    epoch_steps += 1
-                loss_total += loss_sum.detach().item()
-                count_total += count
-                epoch_images += images.shape[0]
-                if epoch_steps and epoch_steps % 100 == 0:
-                    progress.set_postfix(loss=loss_total / max(count_total, 1))
-            torch.cuda.synchronize()
-            train_seconds = time.perf_counter() - start
-            peak_allocated = torch.cuda.max_memory_allocated() / 2**30
-            peak_reserved = torch.cuda.max_memory_reserved() / 2**30
-            total_steps += epoch_steps
-            total_images += epoch_images
-            if count_total == 0:
-                raise RuntimeError("No valid training targets.")
-            dev_start = time.perf_counter()
-            dev = self.evaluate(cached_model, loaders["dev"], task)
-            dev_seconds = time.perf_counter() - dev_start
-            row = {
-                "training_mode": "cached_head", "train_precision": c["TRAIN_PRECISION"], "evaluation_precision": "fp32", "evaluation_tf32": c.get("EVAL_TF32", False), "epoch": epoch, "lr": optimizer.param_groups[0]["lr"],
-                "train_loss": loss_total / count_total, "train_seconds": train_seconds,
-                "train_images_per_second": epoch_images / train_seconds,
-                "train_images": epoch_images, "optimizer_steps": epoch_steps,
-                "train_peak_allocated_gib": peak_allocated, "train_peak_reserved_gib": peak_reserved,
-                "dev_seconds": dev_seconds, **{f"dev_{k}": v for k, v in dev.items()},
-            }
-            history.append(row)
-            write_csv(directory / "epochs.csv", history)
-            checkpoint = {
-                "model_name": name, "task": task, "epoch": epoch,
-                "feature_dim": model.backbone.feature_dim, "input_size": c["SIZE"],
-                "head_state_dict": {k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
-                "dev_metrics": dev, "training_mode": "cached_head", "train_precision": c["TRAIN_PRECISION"], "evaluation_precision": "fp32", "evaluation_tf32": c.get("EVAL_TF32", False),
-            }
-            atomic_torch_save(checkpoint, directory / "last_head.pt")
-            if dev[metric] > best_score:
-                best_score, best_epoch = dev[metric], epoch
-                atomic_torch_save(checkpoint, directory / "best_head.pt")
-            scheduler.step()
-            print(f"  train loss={row['train_loss']:.4f} | dev {metric}={dev[metric]:.2f} | train={train_seconds / 60:.1f} min | peak allocated={peak_allocated:.2f} GiB")
-        fit_seconds = time.perf_counter() - fit_start
-        optimizer.zero_grad(set_to_none=True)
-        del optimizer, scheduler, logits, loss_sum, images, target
-        if "loss" in locals():
-            del loss
-        head.load_state_dict(torch.load(directory / "best_head.pt", map_location="cpu", weights_only=True)["head_state_dict"])
-        test_start = time.perf_counter()
-        heldout = self.evaluate(model, loaders["val"], task)
-        test_seconds = time.perf_counter() - test_start
-        images, target = check_images.to(self.device), check_target.to(self.device)
-        if images.shape[0] != c["BATCH_SIZE"]:
-            raise ValueError("Dev split must contain at least one full benchmark batch.")
-        gc.collect()
-        torch.cuda.empty_cache()
-        speed = self.benchmark(model, images, task, directory)
-        # Separate from GPU timing: operator counters can alter dispatch and
-        # add overhead, so benchmark() above runs without these hooks.
-        compute = {}
-        try:
-            compute.update(measure_flops_on_dataset(
-                model, raw_dev_dataset, task, c["BATCH_SIZE"],
-                c["FLOP_BATCHES"], c["SEED"], directory,
-                module_names=(c["ATTENTION_MODULE_NAMES"] or {}).get(name),
-            ))
-            whole = compute["whole_model_forward_gflops_per_image"]
-            if whole is None:
-                print("Whole-model FLOPs require review:", compute["whole_model_flops_unmapped_ops"])
-            else:
-                print(f"Whole-model forward: {whole:.4f} GFLOPs/image (2 FLOPs/MAC).")
-            value = compute["attention_forward_gflops_per_image"]
-            if value is None:
-                print("Attention FLOPs require coverage review:",
-                      compute["attention_flops_unmapped_ops"],
-                      compute["attention_flops_uncounted_modules"])
-            else:
-                print(f"Attention forward: {value:.4f} GFLOPs/image (2 FLOPs/MAC).")
-        except Exception as exc:
-            compute.update(whole_model_flops_coverage_ok=False,
-                           whole_model_forward_gflops_per_image=None,
-                           whole_model_flops_error=str(exc),
-                           attention_flops_coverage_ok=False,
-                           attention_forward_gflops_per_image=None,
-                           attention_flops_error=str(exc))
-            (directory / "attention_flops_error.txt").write_text(
-                traceback.format_exc(), encoding="utf-8"
-            )
-            print("Attention FLOP counting unavailable:", exc)
-        try:
-            compute.update(self.profile_model(model, images, target, task, directory))
-            # Keep the new attention summary in the existing profiling file too.
-            profiling = json.loads((directory / "profiling.json").read_text(encoding="utf-8"))
-            profiling.update(compute)
-            write_json(directory / "profiling.json", profiling)
-        except Exception as exc:
-            compute["profiling_error"] = str(exc)
-            (directory / "profiling_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
-            print("Profiling unavailable:", exc)
-        result = {
-            "model": name, "task": task, "status": "completed", "seed": c["SEED"],
-            "resolution": c["SIZE"], "batch_size": c["BATCH_SIZE"], "epochs": c["EPOCHS"][task],
-            "best_epoch": best_epoch, "best_dev_metric": best_score, "selection_metric": metric,
-            "backbone_parameters": sum(p.numel() for p in model.backbone.parameters()),
-            "trainable_head_parameters": sum(p.numel() for p in head.parameters()),
-            "total_training_images": total_images, "total_optimizer_steps": total_steps,
-            "training_mode": "cached_head", "train_precision": c["TRAIN_PRECISION"], "evaluation_precision": "fp32", "evaluation_tf32": c.get("EVAL_TF32", False),
-            "cache_dtype": "float32",
-            "cache_train_seconds": cache_stats["train"]["seconds"],
-            "cache_dev_seconds": cache_stats["dev"]["seconds"],
-            "cache_build_seconds": sum(v["seconds"] for v in cache_stats.values()),
-            "cache_bytes": sum(v["bytes"] for v in cache_stats.values()),
-            "cache_backbone_image_forwards": sum(v["backbone_image_forwards"] for v in cache_stats.values()),
-            "head_training_seconds": sum(r["train_seconds"] for r in history),
-            "training_seconds": cache_stats["train"]["seconds"] + sum(r["train_seconds"] for r in history),
-            "training_seconds_scope": "train feature extraction + cached head epochs; excludes dev",
-            "pipeline_fit_seconds_including_cache_dev_and_saves": sum(v["seconds"] for v in cache_stats.values()) + fit_seconds,
-            "experiment_seconds_including_measurements": time.perf_counter() - experiment_start,
-            "profile_training_scope": "uncached representative forward + head backward; excludes optimizer",
-            "inference_scope": "full original RGB model; no feature cache",
-            "cache_directory": str(cache_dir),
-            "fit_seconds_including_dev_and_saves": fit_seconds,
-            "heldout_evaluation_seconds": test_seconds,
-            "train_peak_allocated_gib": max(cache_stats["train"]["peak_allocated_gib"], max(r["train_peak_allocated_gib"] for r in history)),
-            "train_peak_reserved_gib": max(cache_stats["train"]["peak_reserved_gib"], max(r["train_peak_reserved_gib"] for r in history)),
-            **{f"heldout_{k}": v for k, v in heldout.items()}, **speed, **compute,
-            "best_head_path": str(directory / "best_head.pt"),
-        }
-        # Close mappings explicitly before deleting files on Windows.
-        for part in ("train", "dev"):
-            loaders[part].dataset.close()
-        result["cache_retained"] = True
-        if not c["KEEP_CACHE"]:
-            try:
-                shutil.rmtree(cache_dir)
-                result["cache_retained"] = False
-            except OSError as exc:
-                result["cache_cleanup_error"] = str(exc)
-                print("Cache cleanup failed; training results are preserved:", exc)
-        write_json(directory / "result.json", result)
-        return result
 
     def run(self):
         self.prepare()
@@ -2185,325 +1121,395 @@ class _Runner:
                     print("FAILED:", exc)
                     print("Full traceback:", self.out / f"{task}_{name}_error.txt")
                     if self.c.get("FAIL_FAST", True):
-                        write_csv(self.out / "baseline measurments.csv", results + [result])
+                        write_csv(self.out / "cropr measurements.csv", results + [result])
                         raise
                 results.append(result)
-                write_csv(self.out / "baseline measurments.csv", results)
+                write_csv(self.out / "cropr measurements.csv", results)
                 gc.collect()
                 torch.cuda.empty_cache()
         print("\nFinished.  Measurements saved to:")
-        print(self.out / "baseline measurments.csv")
+        print(self.out / "cropr measurements.csv")
         for result in results:
             print(result["task"], result["model"], "→", result["status"])
         return results, self.out
 
 
-def run_baselines(
-    model_factory, *, ROOT=None, SEED=42, SIZE=448,
-    MODEL_NAMES=("dinov2", "siglip2", "radio"), EPOCHS=None,
-    BATCH_SIZE=2, MICRO_BATCH_SIZE=1, GRAD_ACCUM_STEPS=16, EVAL_BATCH_SIZE=1, LR=None, WEIGHT_DECAY=0.01, NUM_WORKERS=0,
-    BENCH_WARMUP=10, BENCH_REPEATS=50, PROFILE_REPEATS=3,
-    IMAGENET_ROOT=None, ADE_ROOT=None, SPLIT_ROOT=None,
-    ATTENTION_MODULE_NAMES=None, FLOP_BATCHES=3, BENCH_TRIALS=3,
-    CACHE_ROOT=None, CACHE_BATCH_SIZE=None, KEEP_CACHE=False,
-    TASKS=("classification", "segmentation"),
-    TRAINING_MODE="lora", LORA_R=8, LORA_ALPHA=16.0, LORA_LR=1e-4,
-    LORA_TARGETS=None, LORA_UNWRAP_BACKBONE_FORWARD=True,
-    MAX_GRAD_NORM=1.0, STRICT_DETERMINISM=False,
-    TRAIN_PRECISION="bf16", LOADER_BACKEND="process", FAIL_FAST=True,
-    COMPILE_LORA=False, COMPILE_BACKEND="inductor", COMPILE_MODE="default", EVAL_TF32=False,
-):
-    """Run selected TASKS and MODEL_NAMES; return (results, OUT).
+def backward_cropr_batch(model, images, target, task, main_normalizer, aux_normalizer,
+                         aux_weight, autocast):
+    """Two independent normalizers: image/pixel labels and auxiliary grid labels."""
+    with autocast():
+        logits = model(images, task)
+    main, count = loss_sum_and_count(logits.float(), target, task)
+    aux, aux_count = model.auxiliary_loss_sums(target)
+    if not torch.isfinite(logits).all() or not torch.isfinite(main) or not torch.isfinite(aux):
+        raise RuntimeError("Non-finite Cropr logits/loss; no optimizer update")
+    if count or aux_count:
+        (main / main_normalizer + aux_weight * aux / aux_normalizer).backward()
+    model.auxiliary_predictions = []
+    return main.detach().item(), count, aux.detach().item(), aux_count
 
-    Pass the existing BaselineModel class as model_factory.  It is constructed
-    only in the parent process.  When called from a .py script (not a notebook),
-    put the call under `if __name__ == "__main__":`.
+
+def finish_cropr_step(model, optimizer, main_normalizer, main_count,
+                      aux_normalizer, aux_count, max_norm):
+    """Normalize final/partial accumulation windows without bias from ignored pixels.
+
+    This separation is valid because the backbone is frozen and the auxiliary
+    input is detached: main loss updates only the head; auxiliary only pruners.
     """
-    ROOT = Path.cwd() if ROOT is None else Path(ROOT).expanduser().resolve()
-    EPOCHS = dict(EPOCHS) if EPOCHS is not None else {"classification": 3, "segmentation": 5}
-    LR = dict(LR) if LR is not None else {"classification": 1e-3, "segmentation": 1e-3}
-    IMAGENET_ROOT = Path(IMAGENET_ROOT) if IMAGENET_ROOT is not None else ROOT / "datasets/imagenet"
-    ADE_ROOT = Path(ADE_ROOT) if ADE_ROOT is not None else ROOT / "datasets/ade20k/ADEChallengeData2016"
-    SPLIT_ROOT = Path(SPLIT_ROOT) if SPLIT_ROOT is not None else ROOT / "datasets/splits"
-    MODEL_NAMES = tuple(MODEL_NAMES)
-    TASKS = tuple(TASKS)
-    if not TASKS or len(set(TASKS)) != len(TASKS) or any(
-            t not in ("classification", "segmentation") for t in TASKS):
-        raise ValueError("TASKS must contain classification and/or segmentation, without duplicates.")
-    ATTENTION_MODULE_NAMES = dict(ATTENTION_MODULE_NAMES or {})
-    CACHE_ROOT = (ROOT / "baseline feature cache" if CACHE_ROOT is None
-                  else Path(CACHE_ROOT).expanduser().resolve())
-    CACHE_BATCH_SIZE = BATCH_SIZE if CACHE_BATCH_SIZE is None else CACHE_BATCH_SIZE
-    if not isinstance(KEEP_CACHE, bool):
-        raise ValueError("KEEP_CACHE must be True or False.")
-    if TRAINING_MODE not in ("cached_head", "lora"):
-        raise ValueError("TRAINING_MODE must be cached_head or lora.")
-    if TRAIN_PRECISION not in ("fp32", "bf16"):
-        raise ValueError("TRAIN_PRECISION must be fp32 or bf16.")
-    if not isinstance(COMPILE_LORA, bool) or not isinstance(EVAL_TF32, bool):
-        raise ValueError("COMPILE_LORA and EVAL_TF32 must be booleans.")
-    if COMPILE_LORA and TRAINING_MODE != "lora":
-        raise ValueError("COMPILE_LORA requires TRAINING_MODE='lora'.")
-    if not isinstance(COMPILE_BACKEND, str) or not COMPILE_BACKEND:
-        raise ValueError("COMPILE_BACKEND must be a nonempty backend name.")
-    if COMPILE_MODE not in ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"):
-        raise ValueError("Unsupported COMPILE_MODE.")
-    if LOADER_BACKEND not in ("process", "thread"):
-        raise ValueError("LOADER_BACKEND must be process or thread.")
-    if not isinstance(FAIL_FAST, bool):
-        raise ValueError("FAIL_FAST must be boolean.")
-    LORA_TARGETS = dict(LORA_TARGETS or {})
-    if any(not isinstance(v, (list, tuple)) or not all(isinstance(n, str) for n in v)
-           for v in LORA_TARGETS.values()):
-        raise ValueError("LORA_TARGETS must map model names to lists of exact projection paths.")
-    if isinstance(LORA_R, bool) or not isinstance(LORA_R, int) or LORA_R < 1:
-        raise ValueError("LORA_R must be a positive integer.")
-    for value in (LORA_ALPHA, LORA_LR):
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError("LoRA alpha and learning rate must be positive and finite.")
-    if math.isnan(MAX_GRAD_NORM) or MAX_GRAD_NORM <= 0:
-        raise ValueError("MAX_GRAD_NORM must be positive (infinity disables clipping).")
-    if not math.isfinite(WEIGHT_DECAY) or WEIGHT_DECAY < 0:
-        raise ValueError("WEIGHT_DECAY must be finite and nonnegative.")
-    if not isinstance(STRICT_DETERMINISM, bool) or not isinstance(LORA_UNWRAP_BACKBONE_FORWARD, bool):
-        raise ValueError("Determinism and forward unwrap options must be booleans.")
-    config = dict(locals())
-    config.pop("model_factory")
-    if not callable(model_factory):
-        raise TypeError("Pass your BaselineModel class as the first argument.")
-    for key in ("SIZE", "BATCH_SIZE", "BENCH_REPEATS", "PROFILE_REPEATS", "FLOP_BATCHES", "BENCH_TRIALS", "CACHE_BATCH_SIZE", "MICRO_BATCH_SIZE", "GRAD_ACCUM_STEPS", "EVAL_BATCH_SIZE"):
-        if isinstance(config[key], bool) or not isinstance(config[key], int) or config[key] < 1:
-            raise ValueError(f"{key} must be a positive integer.")
-    for key in ("NUM_WORKERS", "BENCH_WARMUP"):
-        if not isinstance(config[key], int) or config[key] < 0:
-            raise ValueError(f"{key} must be a nonnegative integer.")
-    for task in TASKS:
-        if (not isinstance(EPOCHS[task], int) or EPOCHS[task] < 1
-                or not math.isfinite(LR[task]) or LR[task] <= 0):
-            raise ValueError(f"{task} requires positive epochs and learning rate.")
-    if not MODEL_NAMES or len(set(MODEL_NAMES)) != len(MODEL_NAMES):
-        raise ValueError("MODEL_NAMES must be nonempty with no duplicates.")
-    return _Runner(model_factory, config).run()
+    head = getattr(model, f"{model.task}_head")
+    for parameters, denominator, count in (
+        (head.parameters(), main_normalizer, main_count),
+        (model.pruners.parameters(), aux_normalizer, aux_count),
+    ):
+        for p in parameters:
+            if not count:
+                p.grad = None  # no AdamW decay for an all-ignored branch
+            elif p.grad is not None:
+                p.grad.mul_(denominator / count)
+    parameters = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+    if not parameters:
+        optimizer.zero_grad(set_to_none=True)
+        return None
+    if aux_count and any(p.queries.grad is None for p in model.pruners.values()):
+        raise RuntimeError("Disconnected Cropr queries; refusing silent head-only training")
+    norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=True)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return float(norm)
 
 
-def add_forward_flops_to_run(model_factory, run_dir, *, ROOT=None,
-                               IMAGENET_ROOT=None, ADE_ROOT=None, SPLIT_ROOT=None,
-                               ATTENTION_MODULE_NAMES=None, FLOP_BATCHES=3,
-                               REBENCHMARK=False, BENCH_TRIALS=3):
-    """Backfill consistent forward FLOPs for completed experiments, no retraining.
-
-    Loads saved best heads and their original local backbones. Updates result.json,
-    profiling.json and CSV with counts; detailed audits go in flop_samples/.
-    Optional REBENCHMARK=True reruns inference timing using the recorded warmup,
-    repeats and batch size, and BENCH_TRIALS independent trials. It preserves the
-    first pre-refresh timing fields in benchmark_before_refresh.json.
-    Checkpoints, training history and accuracy metrics remain unchanged.
-    """
-    for key, value in [('FLOP_BATCHES', FLOP_BATCHES), ('BENCH_TRIALS', BENCH_TRIALS)]:
-        if not isinstance(value, int) or value < 1:
-            raise ValueError(f'{key} must be a positive integer.')
-    if not torch.cuda.is_available():
-        raise RuntimeError('CUDA unavailable.  Select your CUDA PyTorch notebook kernel.')
-    run_dir = Path(run_dir).expanduser().resolve()
-    root = Path.cwd() if ROOT is None else Path(ROOT).expanduser().resolve()
-    config = json.loads((run_dir / 'configuration.json').read_text(encoding='utf-8'))
-    roots = {
-        'classification': Path(IMAGENET_ROOT) if IMAGENET_ROOT is not None else root / 'datasets/imagenet',
-        'segmentation': Path(ADE_ROOT) if ADE_ROOT is not None else root / 'datasets/ade20k/ADEChallengeData2016',
-    }
-    split_root = Path(SPLIT_ROOT) if SPLIT_ROOT is not None else root / 'datasets/splits'
-    size, batch_size = config['input_size'], config['batch_size']
-    names_by_model = (config.get('attention_module_names') or {}) if ATTENTION_MODULE_NAMES is None else ATTENTION_MODULE_NAMES
-    csv_path = run_dir / 'baseline measurments.csv'
-    with open(csv_path, newline='', encoding='utf-8') as f:
-        rows = list(csv.DictReader(f))
-    os.environ['HF_HUB_OFFLINE'] = '1'
-    os.environ['TRANSFORMERS_OFFLINE'] = '1'
-    torch.cuda.set_device(0)
-    _set_tf32(False)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    for row in rows:
-        if row.get('status') != 'completed':
-            continue
-        name, task = row['model'], row['task']
-        directory = run_dir / f'{task}_{name}'
-        result_path = directory / 'result.json'
-        # Read canonical numeric results rather than round-tripping them through CSV strings.
-        result = json.loads(result_path.read_text(encoding='utf-8'))
-        split_file = split_root / ('imagenet_split.json' if task == 'classification' else 'ade20k_split.json')
-        expected_hash = config.get('split_sha256', {}).get(task)
-        if expected_hash and hashlib.sha256(split_file.read_bytes()).hexdigest() != expected_hash:
-            raise ValueError(f'Saved split has changed since training: {split_file}')
-        split = json.loads(split_file.read_text(encoding='utf-8'))
-        ds = SavedSplitDataset(task, 'dev', split['dev_files'], roots[task], size,
-                               split.get('class_to_idx', {}), {})
-        if len(ds) < batch_size:
-            raise ValueError(f'Dev split is smaller than the recorded batch size: {task}')
-        model = images = None
-        print(f'Measuring forward FLOPs: {task} / {name}')
+class _CroprRunner(_Runner):
+    def profile_training(self, model, images, target, task, directory):
+        model.train()
+        repeats = self.c['PROFILE_REPEATS']
         try:
-            seed_everything(config['seed'])
-            model = model_factory(name)
-            inactive = 'segmentation' if task == 'classification' else 'classification'
-            setattr(model, f'{inactive}_head', nn.Identity())
-            checkpoint = torch.load(directory / ('best_lora.pt' if config.get('training_mode') == 'lora' else 'best_head.pt'), map_location='cpu', weights_only=True)
-            if (checkpoint['model_name'] != name or checkpoint['task'] != task or
-                    checkpoint['input_size'] != size):
-                raise ValueError('Checkpoint metadata does not match this experiment.')
-            load_baseline_checkpoint(model, checkpoint, merge=True)
-            model = model.to('cuda:0').eval()
-            if REBENCHMARK:
-                backup = directory / 'benchmark_before_refresh.json'
-                if not backup.exists():
-                    write_json(backup, {k: v for k, v in result.items()
-                                       if k.startswith(('b1_', f'b{batch_size}_', 'benchmark_'))})
-                timing_runner = _Runner(model_factory, {
-                    'ROOT': root, 'IMAGENET_ROOT': roots['classification'],
-                    'ADE_ROOT': roots['segmentation'], 'SPLIT_ROOT': split_root,
-                    'BATCH_SIZE': batch_size, 'BENCH_TRIALS': BENCH_TRIALS,
-                    'BENCH_WARMUP': config.get('bench_warmup', 10),
-                    'BENCH_REPEATS': config.get('bench_repeats', 50),
-                })
-                images = torch.stack([ds[i][0] for i in range(batch_size)]).to('cuda:0')
-                result.update(timing_runner.benchmark(model, images, task, directory))
-                del images
-                images = None
-            summary = measure_flops_on_dataset(
-                model, ds, task, batch_size, FLOP_BATCHES, config['seed'], directory,
-                module_names=names_by_model.get(name))
-            # Clear stale attention fields if an earlier backfill had failed.
-            for key in list(result):
-                if key.startswith(('attention_', 'whole_model_', 'flops_sample_')) and key != 'attention_gpu_time_pct':
-                    result.pop(key)
-            result.update(summary)
-            write_json(result_path, result)
-            profile_path = directory / 'profiling.json'
-            if profile_path.exists():
-                profiling = json.loads(profile_path.read_text(encoding='utf-8'))
-                for key in list(profiling):
-                    if key.startswith(('attention_', 'whole_model_', 'flops_sample_')) and key != 'attention_gpu_time_pct':
-                        profiling.pop(key)
-                profiling.update(summary)
-                write_json(profile_path, profiling)
-            row.clear()
-            row.update(result)
-            write_csv(csv_path, rows)
-            write_json(directory / 'measurement_refresh.json', {
-                'timestamp': datetime.now().isoformat(), 'counter_version': 3,
-                'flop_batches': FLOP_BATCHES, 'timing_refreshed': REBENCHMARK,
-                'benchmark_trials': BENCH_TRIALS if REBENCHMARK else result.get('benchmark_trials'),
-                'torch': torch.__version__, 'gpu': torch.cuda.get_device_name(0),
-                'precision': 'float32; TF32 disabled',
-            })
-            value = summary['whole_model_forward_gflops_per_image']
-            if value is not None:
-                print(f'  {value:.4f} GFLOPs/image (2 FLOPs/MAC).')
-            else:
-                print('  Coverage review needed; inspect forward_flops.json and flop_samples/.')
-        finally:
-            del model, images
-            gc.collect()
-            torch.cuda.empty_cache()
-    return rows, run_dir
-
-
-def add_attention_flops_to_run(*args, **kwargs):
-    """Compatibility alias; backfills both whole-model and attention FLOPs."""
-    return add_forward_flops_to_run(*args, **kwargs)
-
-
-def refresh_component_timings(model_factory, run_dir, *, ROOT=None,
-                              MODEL_NAMES=("radio",), TASKS=("segmentation",),
-                              PROFILE_REPEATS=10, WARMUP=10):
-    """Refresh forward component attribution from saved heads, without training.
-
-    Preserves old reports in a timestamped backup. Updates profiling.json,
-    result.json and the run CSV; accuracy, FLOPs and benchmark speed stay intact.
-    """
-    if PROFILE_REPEATS < 1 or WARMUP < 0:
-        raise ValueError("Require positive repeats and nonnegative warmup.")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required.")
-    run_dir = Path(run_dir).expanduser().resolve()
-    root = Path.cwd() if ROOT is None else Path(ROOT).expanduser().resolve()
-    config = json.loads((run_dir / "configuration.json").read_text(encoding="utf-8"))
-    csv_path = run_dir / "baseline measurments.csv"
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    selected = [r for r in rows if r.get("status") == "completed"
-                and r["model"] in MODEL_NAMES and r["task"] in TASKS]
-    if not selected:
-        raise ValueError("No completed experiments match the selected models/tasks in this folder.")
-    backup = run_dir / ("component_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
-    backup.mkdir()
-    shutil.copy2(csv_path, backup / csv_path.name)
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    torch.cuda.set_device(0)
-    _set_tf32(False)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    size, batch = config["input_size"], config["batch_size"]
-    for row in selected:
-        name, task = row["model"], row["task"]
-        directory = run_dir / f"{task}_{name}"
-        split_path = root / "datasets/splits" / ("imagenet_split.json" if task == "classification" else "ade20k_split.json")
-        expected = config.get("split_sha256", {}).get(task)
-        if expected and hashlib.sha256(split_path.read_bytes()).hexdigest() != expected:
-            raise ValueError("Dataset split changed since training.")
-        split = json.loads(split_path.read_text(encoding="utf-8"))
-        data_root = root / ("datasets/imagenet" if task == "classification" else "datasets/ade20k/ADEChallengeData2016")
-        ds = SavedSplitDataset(task, "dev", split["dev_files"], data_root,
-                               size, split.get("class_to_idx", {}), {})
-        if len(ds) < batch:
-            raise ValueError("Dev split smaller than recorded batch size.")
-        saved = backup / directory.name
-        saved.mkdir()
-        for filename in ("result.json", "profiling.json"):
-            if (directory / filename).exists():
-                shutil.copy2(directory / filename, saved / filename)
-        model = images = None
-        try:
-            seed_everything(config["seed"])
-            model = model_factory(name)
-            inactive = "segmentation" if task == "classification" else "classification"
-            setattr(model, f"{inactive}_head", nn.Identity())
-            checkpoint = torch.load(directory / ("best_lora.pt" if config.get("training_mode") == "lora" else "best_head.pt"), map_location="cpu", weights_only=True)
-            if (checkpoint["model_name"], checkpoint["task"], checkpoint["input_size"]) != (name, task, size):
-                raise ValueError("Checkpoint metadata mismatch.")
-            load_baseline_checkpoint(model, checkpoint, merge=True)
-            model = model.to("cuda:0").eval()
-            images = torch.stack([ds[i][0] for i in range(batch)]).to("cuda:0")
-            with torch.no_grad():
-                for _ in range(WARMUP):
-                    model(images, task)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                         record_shapes=True, with_flops=True) as prof:
+                for _ in range(repeats):
+                    model.zero_grad(set_to_none=True)
+                    with record_function('training/forward_and_cropr_head_backward'):
+                        with self.training_autocast():
+                            logits = model(images, task)
+                        main, count = loss_sum_and_count(logits.float(), target, task)
+                        aux, aux_count = model.auxiliary_loss_sums(target)
+                        if not count:
+                            raise ValueError('No valid labels in training profile batch')
+                        (main / count + self.c['AUX_WEIGHT'] * aux / max(aux_count, 1)).backward()
+                        model.auxiliary_predictions = []
                 torch.cuda.synchronize()
-                with component_labels(model, task) as matched:
-                    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-                        for _ in range(PROFILE_REPEATS):
-                            with record_function("component/total"):
-                                model(images, task)
-                        torch.cuda.synchronize()
-            prof.export_chrome_trace(str(directory / "component_refresh_trace.json"))
-            summary = _component_time_summary(prof, matched)
-            summary.update(component_profile_repeats=PROFILE_REPEATS,
-                           component_profile_batch_size=batch)
-            for filename in ("profiling.json", "result.json"):
-                path = directory / filename
-                doc = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-                doc.update(summary)
-                if filename == "profiling.json":
-                    doc["matched_modules"] = matched
-                write_json(path, doc)
-                if filename == "result.json":
-                    row.clear()
-                    row.update(doc)
-            write_csv(csv_path, rows)
-            print(name, task, "available:", summary["component_gpu_attribution_available"],
-                  summary["component_gpu_attribution_reason"])
+            prof.export_chrome_trace(str(directory / 'training_trace.json'))
+            return {'forward_backward_partial_gflops_per_image':
+                    sum(float(e.flops or 0) for e in prof.key_averages()) / repeats / len(images) / 1e9,
+                    'training_profile_precision': self.c['TRAIN_PRECISION'],
+                    'training_profile_batch_size': len(images)}
         finally:
-            del model, images
-            gc.collect()
-            torch.cuda.empty_cache()
-    return rows, run_dir
+            model.zero_grad(set_to_none=True)
+            model.auxiliary_predictions = []
+            model.eval()
+
+    def run_experiment(self, name, task):
+        c = self.c
+        experiment_start = time.perf_counter()
+        seed_everything(c['SEED'])
+        gc.collect()
+        torch.cuda.empty_cache()
+        directory = self.out / f'{task}_{name}'
+        directory.mkdir()
+        loaders = {p: self.make_loader(task, p) for p in ('train', 'dev', 'val')}
+        if len(loaders['dev'].dataset) < c['BATCH_SIZE']:
+            raise ValueError('Dev split must contain a full benchmark batch')
+        spec = dict(variant=c['VARIANT'], pruning_rate=c['PRUNING_RATE'],
+                    input_size=c['SIZE'], num_heads=c['NUM_HEADS'])
+        model = cropr_module.build_cropr_model(name, task, base=self.model_factory(name), **spec)
+        model = model.to(self.device)
+        head = getattr(model, f'{task}_head')
+        head.requires_grad_(True)
+        base_hash = _state_digest(model.backbone.state_dict())
+        initial_queries = {k: p.queries.detach().cpu().clone() for k, p in model.pruners.items()}
+        allowed = {id(p) for p in list(head.parameters()) + list(model.pruners.parameters())}
+        if {id(p) for p in model.parameters() if p.requires_grad} != allowed:
+            raise RuntimeError('Unexpected trainable parameters outside the head/pruners')
+        # A real RGB dev image verifies shape, zero-pruning equivalence and query gradients.
+        check_images, _ = next(iter(loaders['dev']))
+        probe = check_images[:1].to(self.device)
+        model.eval()
+        saved_schedule = model.schedule.copy()
+        try:
+            model.schedule = dict.fromkeys(saved_schedule, 0)
+            with torch.no_grad():
+                expected = model.model(probe, task)
+                actual = model(probe, task)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            model.schedule = saved_schedule
+        model.train()
+        with self.training_autocast():
+            actual = model(probe, task)
+        shape = (1, 1000) if task == 'classification' else (1, 150, c['SIZE'], c['SIZE'])
+        if tuple(actual.shape) != shape:
+            raise ValueError(f'Unexpected Cropr output shape: {actual.shape}; expected {shape}')
+        synthetic_target = torch.zeros((1,) if task == 'classification' else (1, c['SIZE'], c['SIZE']),
+                                       device=self.device, dtype=torch.long)
+        audit_loss = model.auxiliary_loss(synthetic_target)
+        audit_loss.backward()
+        for key, pruner in model.pruners.items():
+            grad = pruner.queries.grad
+            if grad is None or not torch.isfinite(grad).all() or not torch.count_nonzero(grad):
+                raise RuntimeError(f'Query gradient audit failed at stage {key}')
+        if any(p.grad is not None for p in model.backbone.parameters()):
+            raise RuntimeError('Auxiliary loss must not update the frozen backbone')
+        model.zero_grad(set_to_none=True)
+        model.auxiliary_predictions = []
+        write_json(directory / 'cropr_setup.json', {
+            **spec, 'schedule': model.schedule, 'prefix_tokens': model.prefix,
+            'grid_size': model.grid_size, 'zero_pruning_equivalence': True,
+            'query_gradient_connectivity': True, 'backbone_eval_mode': True,
+            'pretrained_backbone_sha256': base_hash,
+        })
+        del probe, actual, expected, synthetic_target, audit_loss, check_images
+        optimizer = torch.optim.AdamW([
+            {'params': head.parameters(), 'lr': c['LR'][task], 'name': 'head'},
+            {'params': model.pruners.parameters(), 'lr': c['CROPR_LR'], 'name': 'cropr'},
+        ], weight_decay=c['WEIGHT_DECAY'])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=c['EPOCHS'][task])
+        metric = 'top1_pct' if task == 'classification' else 'miou_pct'
+        best_score, best_epoch = -float('inf'), None
+        history = []
+        total_steps = total_images = 0
+        fit_start = time.perf_counter()
+        for epoch in range(1, c['EPOCHS'][task] + 1):
+            seed_everything(c['SEED'] + epoch)
+            loaders['train'].generator.manual_seed(c['SEED'] + epoch)
+            model.train()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            started = time.perf_counter()
+            main_sum = aux_sum = 0.0
+            main_count = aux_count = epoch_images = epoch_steps = 0
+            window_main = window_aux = window_batches = 0
+            max_grad_norm = 0.0
+            main_den = aux_den = c['MICRO_BATCH_SIZE'] * c['GRAD_ACCUM_STEPS']
+            if task == 'segmentation':
+                main_den *= c['SIZE'] ** 2
+                aux_den *= math.prod(model.grid_size)
+            optimizer.zero_grad(set_to_none=True)
+            for images, target in timed_image_batches(loaders['train'], f'{task}/{name} Cropr epoch {epoch}'):
+                images = images.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True)
+                main, count, aux, auxiliary_count = backward_cropr_batch(
+                    model, images, target, task, main_den, aux_den, c['AUX_WEIGHT'], self.training_autocast)
+                main_sum += main
+                aux_sum += aux
+                main_count += count
+                aux_count += auxiliary_count
+                window_main += count
+                window_aux += auxiliary_count
+                window_batches += 1
+                epoch_images += len(images)
+                del images, target
+                if window_batches == c['GRAD_ACCUM_STEPS']:
+                    norm = finish_cropr_step(model, optimizer, main_den, window_main,
+                                            aux_den, window_aux, c['MAX_GRAD_NORM'])
+                    if norm is not None:
+                        epoch_steps += 1
+                        max_grad_norm = max(max_grad_norm, norm)
+                    window_main = window_aux = window_batches = 0
+            if window_batches:
+                norm = finish_cropr_step(model, optimizer, main_den, window_main,
+                                        aux_den, window_aux, c['MAX_GRAD_NORM'])
+                if norm is not None:
+                    epoch_steps += 1
+                    max_grad_norm = max(max_grad_norm, norm)
+            torch.cuda.synchronize()
+            train_seconds = time.perf_counter() - started
+            allocated = torch.cuda.max_memory_allocated() / 2**30
+            reserved = torch.cuda.max_memory_reserved() / 2**30
+            if not main_count or not aux_count or not epoch_steps:
+                raise RuntimeError('No valid main/auxiliary targets or optimizer steps')
+            if _state_digest(model.backbone.state_dict()) != base_hash:
+                raise RuntimeError('Frozen backbone changed during training')
+            if not any(not torch.equal(p.queries.detach().cpu(), initial_queries[k])
+                       for k, p in model.pruners.items()):
+                raise RuntimeError('Queries did not change; refusing silent head-only training')
+            total_steps += epoch_steps
+            total_images += epoch_images
+            started = time.perf_counter()
+            dev = self.evaluate(model, loaders['dev'], task)
+            dev_seconds = time.perf_counter() - started
+            row = dict(training_mode='cropr', train_precision=c['TRAIN_PRECISION'], epoch=epoch,
+                       evaluation_precision='fp32', evaluation_tf32=c['EVAL_TF32'],
+                       lr=optimizer.param_groups[0]['lr'], cropr_lr=optimizer.param_groups[1]['lr'],
+                       train_loss=main_sum / main_count, train_aux_loss=aux_sum / aux_count,
+                       train_total_loss=main_sum / main_count + c['AUX_WEIGHT'] * aux_sum / aux_count,
+                       train_seconds=train_seconds, train_images_per_second=epoch_images / train_seconds,
+                       train_images=epoch_images, optimizer_steps=epoch_steps,
+                       micro_batch_size=c['MICRO_BATCH_SIZE'], grad_accum_steps=c['GRAD_ACCUM_STEPS'],
+                       effective_train_batch_size=c['MICRO_BATCH_SIZE'] * c['GRAD_ACCUM_STEPS'],
+                       train_peak_allocated_gib=allocated, train_peak_reserved_gib=reserved,
+                       max_preclip_grad_norm=max_grad_norm, dev_seconds=dev_seconds,
+                       **{f'dev_{k}': v for k, v in dev.items()})
+            history.append(row)
+            write_csv(directory / 'epochs.csv', history)
+            checkpoint = dict(
+                model_name=name, task=task, epoch=epoch, cropr=spec,
+                training_mode='cropr', train_precision=c['TRAIN_PRECISION'], evaluation_precision='fp32',
+                evaluation_tf32=c['EVAL_TF32'], input_size=c['SIZE'], feature_dim=model.backbone.feature_dim,
+                head_state_dict={k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
+                pruner_state_dict={k: v.detach().cpu().clone() for k, v in model.pruners.state_dict().items()},
+                pretrained_backbone_sha256=base_hash, dev_metrics=dev, seed=c['SEED'],
+                checkpoint_format_version=1, resume_supported=False,
+            )
+            atomic_torch_save(checkpoint, directory / 'last_cropr.pt')
+            if dev[metric] > best_score:
+                best_score, best_epoch = dev[metric], epoch
+                atomic_torch_save(checkpoint, directory / 'best_cropr.pt')
+            del checkpoint
+            scheduler.step()
+            print(f"  main={row['train_loss']:.4f}, aux={row['train_aux_loss']:.4f} | dev {metric}={dev[metric]:.2f} | peak={allocated:.2f} GiB")
+        fit_seconds = time.perf_counter() - fit_start
+        del optimizer, scheduler, initial_queries
+        checkpoint = torch.load(directory / 'best_cropr.pt', map_location='cpu', weights_only=True)
+        head.load_state_dict(checkpoint['head_state_dict'])
+        model.pruners.load_state_dict(checkpoint['pruner_state_dict'])
+        del checkpoint
+        compute = {}
+        images, target = next(iter(loaders['train']))
+        images, target = images.to(self.device), target.to(self.device)
+        try:
+            compute.update(self.profile_training(model, images, target, task, directory))
+        except Exception as exc:
+            compute['training_profiling_error'] = str(exc)
+            (directory / 'training_profiling_error.txt').write_text(traceback.format_exc(), encoding='utf-8')
+        del images, target
+        gc.collect()
+        torch.cuda.empty_cache()
+        started = time.perf_counter()
+        heldout = self.evaluate(model, loaders['val'], task)
+        test_seconds = time.perf_counter() - started
+        samples = [loaders['dev'].dataset[i] for i in range(c['BATCH_SIZE'])]
+        images = torch.stack([s[0] for s in samples]).to(self.device)
+        target = torch.stack([torch.as_tensor(s[1]) for s in samples]).to(self.device)
+        del samples
+        speed = self.benchmark(model, images, task, directory)
+        try:
+            compute.update(measure_flops_on_dataset(
+                model, loaders['dev'].dataset, task, c['BATCH_SIZE'], c['FLOP_BATCHES'],
+                c['SEED'], directory, module_names=c['ATTENTION_MODULE_NAMES'].get(name)))
+        except Exception as exc:
+            compute.update(whole_model_flops_coverage_ok=False, whole_model_forward_gflops_per_image=None,
+                           attention_flops_coverage_ok=False, attention_forward_gflops_per_image=None,
+                           flops_error=str(exc))
+            (directory / 'attention_flops_error.txt').write_text(traceback.format_exc(), encoding='utf-8')
+        try:
+            compute.update(self.profile_model(model, images, target, task, directory))
+        except Exception as exc:
+            compute['profiling_error'] = str(exc)
+            (directory / 'profiling_error.txt').write_text(traceback.format_exc(), encoding='utf-8')
+        token_stats = list(model.token_stats)
+        initial_count = token_stats[0]['input_tokens']
+        token_summary = {
+            'cropr_input_patch_tokens': initial_count - model.prefix,
+            'cropr_min_patch_tokens': min(s['input_tokens'] for s in token_stats) - model.prefix,
+            'cropr_removed_patch_tokens': sum(model.schedule.values()),
+            'cropr_final_patch_tokens': token_stats[-1]['input_tokens'] - model.prefix,
+            'cropr_mean_block_tokens': sum(s['input_tokens'] for s in token_stats) / len(token_stats),
+            'cropr_token_processing_reduction_pct': 100 * (1 - sum(s['input_tokens'] for s in token_stats) /
+                                                          (initial_count * len(token_stats))),
+        }
+        write_json(directory / 'tokens.json', {'blocks': token_stats, **token_summary})
+        profiling_path = directory / 'profiling.json'
+        profiling = json.loads(profiling_path.read_text(encoding='utf-8')) if profiling_path.exists() else {}
+        write_json(profiling_path, {**profiling, **compute, **token_summary,
+                                   'profile_training_scope': 'RGB forward + main/auxiliary backward; no optimizer'})
+        result = dict(
+            model=name, task=task, status='completed', seed=c['SEED'], resolution=c['SIZE'],
+            batch_size=c['BATCH_SIZE'], epochs=c['EPOCHS'][task], micro_batch_size=c['MICRO_BATCH_SIZE'],
+            grad_accum_steps=c['GRAD_ACCUM_STEPS'], effective_train_batch_size=c['MICRO_BATCH_SIZE'] * c['GRAD_ACCUM_STEPS'],
+            eval_batch_size=c['EVAL_BATCH_SIZE'], best_epoch=best_epoch, best_dev_metric=best_score,
+            selection_metric=metric, training_mode='cropr', train_precision=c['TRAIN_PRECISION'],
+            evaluation_precision='fp32', evaluation_tf32=c['EVAL_TF32'], cache_enabled=False,
+            cropr_variant=c['VARIANT'], cropr_lr=c['CROPR_LR'], cropr_aux_weight=c['AUX_WEIGHT'],
+            cropr_pruning_rate=c['PRUNING_RATE'], cropr_fusion=model.fusion,
+            cropr_queries_per_stage=next(iter(model.pruners.values())).queries.shape[1],
+            trainable_cropr_parameters=sum(p.numel() for p in model.pruners.parameters()),
+            backbone_parameters=sum(p.numel() for p in model.backbone.parameters()),
+            trainable_head_parameters=sum(p.numel() for p in head.parameters()),
+            total_training_images=total_images, total_optimizer_steps=total_steps,
+            training_seconds=sum(r['train_seconds'] for r in history),
+            training_seconds_scope='RGB loading + main/auxiliary forward/backward + optimizer; excludes dev and audits',
+            fit_seconds_including_dev_and_saves=fit_seconds, heldout_evaluation_seconds=test_seconds,
+            train_peak_allocated_gib=max(r['train_peak_allocated_gib'] for r in history),
+            train_peak_reserved_gib=max(r['train_peak_reserved_gib'] for r in history),
+            inference_scope='full RGB Cropr model; auxiliary aggregation/heads skipped; no feature cache',
+            profile_training_scope='RGB forward + main/auxiliary backward; no optimizer',
+            pretrained_backbone_sha256=base_hash, frozen_state_verified=True,
+            best_checkpoint_path=str(directory / 'best_cropr.pt'),
+            experiment_seconds_including_measurements=time.perf_counter() - experiment_start,
+            # Preserve baseline report fields with explicit N/A, never fabricated zeros.
+            trainable_lora_parameters=None, lora_rank=None, lora_alpha=None, lora_lr=None,
+            inference_lora_merged=None, merge_max_absolute_logit_error=None,
+            cache_train_seconds=None, cache_dev_seconds=None, head_training_seconds=None,
+            pipeline_fit_seconds_including_cache_dev_and_saves=None,
+            **{f'heldout_{k}': v for k, v in heldout.items()}, **speed, **compute, **token_summary,
+        )
+        write_json(directory / 'result.json', result)
+        return result
+
+
+def run_cropr(*, ROOT=None, SEED=42, SIZE=448,
+              MODEL_NAMES=('dinov2', 'siglip2', 'radio'), TASKS=('classification', 'segmentation'),
+              VARIANT='gradual_llf', PRUNING_RATE=8, NUM_HEADS=1, CROPR_LR=1e-4, AUX_WEIGHT=1.0,
+              EPOCHS=None, LR=None, WEIGHT_DECAY=0.01,
+              BATCH_SIZE=2, MICRO_BATCH_SIZE=1, GRAD_ACCUM_STEPS=16, EVAL_BATCH_SIZE=1,
+              TRAIN_PRECISION='bf16', MAX_GRAD_NORM=1.0, EVAL_TF32=False, STRICT_DETERMINISM=False,
+              NUM_WORKERS=4, LOADER_BACKEND='thread', FAIL_FAST=True,
+              BENCH_WARMUP=10, BENCH_REPEATS=50, BENCH_TRIALS=3, FLOP_BATCHES=3, PROFILE_REPEATS=3,
+              IMAGENET_ROOT=None, ADE_ROOT=None, SPLIT_ROOT=None, ATTENTION_MODULE_NAMES=None):
+    """Run real saved splits, select on dev, evaluate held-out, save baseline-compatible metrics.
+
+    One variant per run makes task/model report rows unambiguous. All artifacts
+    are under ROOT/report_2/cropr measurements. No cache, downloads, or resume.
+    """
+    ROOT = cropr_module.resolve_project_root(ROOT)
+    EPOCHS = dict(EPOCHS or {'classification': 2, 'segmentation': 2})
+    LR = dict(LR or {'classification': 1e-3, 'segmentation': 1e-3})
+    IMAGENET_ROOT = Path(IMAGENET_ROOT) if IMAGENET_ROOT is not None else ROOT / 'datasets/imagenet'
+    ADE_ROOT = Path(ADE_ROOT) if ADE_ROOT is not None else ROOT / 'datasets/ade20k/ADEChallengeData2016'
+    SPLIT_ROOT = Path(SPLIT_ROOT) if SPLIT_ROOT is not None else ROOT / 'datasets/splits'
+    ATTENTION_MODULE_NAMES = dict(ATTENTION_MODULE_NAMES or {})
+    MODEL_NAMES, TASKS = tuple(MODEL_NAMES), tuple(TASKS)
+    if not TASKS or len(set(TASKS)) != len(TASKS) or any(t not in {'classification','segmentation'} for t in TASKS):
+        raise ValueError('TASKS must contain classification/segmentation without duplicates')
+    if not MODEL_NAMES or len(set(MODEL_NAMES)) != len(MODEL_NAMES) or any(n not in {'dinov2','siglip2','radio'} for n in MODEL_NAMES):
+        raise ValueError('Choose unique model names from dinov2, siglip2, radio')
+    if VARIANT not in cropr_module.VARIANTS:
+        raise ValueError('Unknown Cropr variant')
+    if VARIANT == 'gradual_no_llf' and 'segmentation' in TASKS:
+        raise ValueError('gradual_no_llf supports classification only; segmentation requires fusion')
+    if SIZE != 448:
+        raise ValueError('This run matches Report 1 at SIZE=448')
+    if TRAIN_PRECISION not in {'bf16', 'fp32'} or LOADER_BACKEND not in {'thread','process'}:
+        raise ValueError('Invalid precision or loader backend')
+    if any(type(v) is not bool for v in (EVAL_TF32, STRICT_DETERMINISM, FAIL_FAST)):
+        raise ValueError('EVAL_TF32, STRICT_DETERMINISM and FAIL_FAST must be booleans')
+    if not math.isfinite(WEIGHT_DECAY) or WEIGHT_DECAY < 0:
+        raise ValueError('WEIGHT_DECAY must be finite and nonnegative')
+    if math.isnan(MAX_GRAD_NORM) or MAX_GRAD_NORM <= 0:
+        raise ValueError('MAX_GRAD_NORM must be positive')
+    for v in (CROPR_LR, AUX_WEIGHT):
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError('CROPR_LR and AUX_WEIGHT must be positive and finite')
+    for task in TASKS:
+        if type(EPOCHS.get(task)) is not int or EPOCHS[task] < 1 or not math.isfinite(LR.get(task, 0)) or LR.get(task, 0) <= 0:
+            raise ValueError(f'{task} requires positive epochs and learning rate')
+    TRAINING_MODE = 'cropr'
+    config = dict(locals())
+    for key in ('BATCH_SIZE','MICRO_BATCH_SIZE','GRAD_ACCUM_STEPS','EVAL_BATCH_SIZE','NUM_HEADS',
+                'BENCH_REPEATS','BENCH_TRIALS','FLOP_BATCHES','PROFILE_REPEATS'):
+        if type(config[key]) is not int or config[key] < 1:
+            raise ValueError(f'{key} must be a positive integer')
+    for key in ('NUM_WORKERS','BENCH_WARMUP','PRUNING_RATE'):
+        if type(config[key]) is not int or config[key] < 0:
+            raise ValueError(f'{key} must be a nonnegative integer')
+    from functools import partial
+    return _CroprRunner(partial(cropr_module.BaselineModel, root=ROOT), config).run()

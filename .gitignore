@@ -7,3 +7,7 @@ models/
 baseline measurments/
 baseline feature cache/
 /models/source/siglip2/
+
+attn source/
+report_2/__pycache__/
+report_2/cropr measurements/

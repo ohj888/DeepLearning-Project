@@ -900,6 +900,7 @@ class _Runner:
         self.out = self.root / "report_2" / "cropr measurements" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.out.mkdir(parents=True, exist_ok=False)
         configuration = {
+            "model_definition_sha256": hashlib.sha256((Path(__file__).resolve().parents[1] / "baseline_models.py").read_bytes()).hexdigest(),
             "training_mode": "cropr", "seed": c["SEED"], "input_size": c["SIZE"],
             "batch_size": c["BATCH_SIZE"], "micro_batch_size": c["MICRO_BATCH_SIZE"],
             "grad_accum_steps": c["GRAD_ACCUM_STEPS"], "eval_batch_size": c["EVAL_BATCH_SIZE"],
@@ -1158,7 +1159,7 @@ def finish_cropr_step(model, optimizer, main_normalizer, main_count,
     """Normalize final/partial accumulation windows without bias from ignored pixels.
 
     This separation is valid because the backbone is frozen and the auxiliary
-    input is detached: main loss updates only the head; auxiliary only pruners.
+    input is detached: main loss updates head/LoRA; auxiliary updates pruners.
     """
     head = getattr(model, f"{model.task}_head")
     for parameters, denominator, count in (
@@ -1181,7 +1182,11 @@ def finish_cropr_step(model, optimizer, main_normalizer, main_count,
                 raise RuntimeError(f"Disconnected LoRA gradients: {name}")
     if aux_count and any(p.queries.grad is None for p in model.pruners.values()):
         raise RuntimeError("Disconnected Cropr queries; refusing silent head-only training")
-    norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=True)
+    # Keep the baseline head/LoRA clipping independent of auxiliary gradients.
+    main_parameters = list(head.parameters()) + [
+        p for p in model.backbone.parameters() if p.requires_grad]
+    norm = torch.nn.utils.clip_grad_norm_(main_parameters, max_norm, error_if_nonfinite=True)
+    torch.nn.utils.clip_grad_norm_(model.pruners.parameters(), max_norm, error_if_nonfinite=True)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     return float(norm)
@@ -1229,7 +1234,11 @@ class _CroprRunner(_Runner):
             raise ValueError('Dev split must contain a full benchmark batch')
         spec = dict(variant=c['VARIANT'], pruning_rate=c['PRUNING_RATE'],
                     input_size=c['SIZE'], num_heads=c['NUM_HEADS'])
-        model = cropr_module.build_cropr_model(name, task, base=self.model_factory(name), **spec)
+        # Match Report 1's base/head construction before consuming any Cropr RNG.
+        base = self.model_factory(name)
+        # Cropr initialization must not shift the CPU/CUDA LoRA random stream.
+        with torch.random.fork_rng():
+            model = cropr_module.build_cropr_model(name, task, base=base, **spec)
         model = model.to(self.device)
         head = getattr(model, f'{task}_head')
         head.requires_grad_(True)
@@ -1306,13 +1315,16 @@ class _CroprRunner(_Runner):
             'grid_size': model.grid_size, 'zero_pruning_equivalence': True,
             'query_gradient_connectivity': True, 'backbone_eval_mode': True,
             'lora': lora_spec, 'lora_initial_equivalence': True, 'lora_gradient_connectivity': True,
+            'initial_state_hash_format': 'tensor_state_v1',
+            'initial_head_sha256': _state_digest(head.state_dict()),
+            'initial_lora_sha256': _state_digest(initial_adapters),
             'pretrained_backbone_sha256': base_hash,
         })
         del probe, actual, expected, synthetic_target, audit_loss, check_images
         optimizer = torch.optim.AdamW([
             {'params': head.parameters(), 'lr': c['LR'][task], 'name': 'head'},
-            {'params': model.pruners.parameters(), 'lr': c['CROPR_LR'], 'name': 'cropr'},
             {'params': adapters, 'lr': c['LORA_LR'], 'name': 'lora'},
+            {'params': model.pruners.parameters(), 'lr': c['CROPR_LR'], 'name': 'cropr'},
         ], weight_decay=c['WEIGHT_DECAY'])
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=c['EPOCHS'][task])
         metric = 'top1_pct' if task == 'classification' else 'miou_pct'
@@ -1384,8 +1396,8 @@ class _CroprRunner(_Runner):
             dev_seconds = time.perf_counter() - started
             row = dict(training_mode='cropr', train_precision=c['TRAIN_PRECISION'], epoch=epoch,
                        evaluation_precision='fp32', evaluation_tf32=c['EVAL_TF32'],
-                       lr=optimizer.param_groups[0]['lr'], cropr_lr=optimizer.param_groups[1]['lr'],
-                       lora_lr=optimizer.param_groups[2]['lr'], adaptation_mode='lora_cropr',
+                       lr=optimizer.param_groups[0]['lr'], cropr_lr=optimizer.param_groups[2]['lr'],
+                       lora_lr=optimizer.param_groups[1]['lr'], adaptation_mode='lora_cropr',
                        train_loss=main_sum / main_count, train_aux_loss=aux_sum / aux_count,
                        train_total_loss=main_sum / main_count + c['AUX_WEIGHT'] * aux_sum / aux_count,
                        train_seconds=train_seconds, train_images_per_second=epoch_images / train_seconds,
@@ -1526,24 +1538,54 @@ class _CroprRunner(_Runner):
         return result
 
 
-def run_cropr(*, ROOT=None, SEED=42, SIZE=448,
-              MODEL_NAMES=('dinov2', 'siglip2', 'radio'), TASKS=('classification', 'segmentation'),
-              VARIANT='gradual_llf', PRUNING_RATE=8, NUM_HEADS=1, CROPR_LR=1e-4, AUX_WEIGHT=1.0,
-              EPOCHS=None, LR=None, WEIGHT_DECAY=0.01,
-              LORA_R=8, LORA_ALPHA=16.0, LORA_LR=1e-4, LORA_TARGETS=None,
-              BATCH_SIZE=2, MICRO_BATCH_SIZE=1, GRAD_ACCUM_STEPS=16, EVAL_BATCH_SIZE=1,
-              TRAIN_PRECISION='bf16', MAX_GRAD_NORM=1.0, EVAL_TF32=False, STRICT_DETERMINISM=False,
-              NUM_WORKERS=4, LOADER_BACKEND='thread', FAIL_FAST=True,
-              BENCH_WARMUP=10, BENCH_REPEATS=50, BENCH_TRIALS=3, FLOP_BATCHES=3, PROFILE_REPEATS=3,
-              IMAGENET_ROOT=None, ADE_ROOT=None, SPLIT_ROOT=None, ATTENTION_MODULE_NAMES=None):
+def run_cropr(
+    *,
+    ROOT=None,
+    SEED=42,
+    SIZE=448,
+    MODEL_NAMES=('dinov2', 'siglip2', 'radio'),
+    TASKS=('classification', 'segmentation'),
+    VARIANT='gradual_llf',
+    PRUNING_RATE=8,
+    NUM_HEADS=1,
+    CROPR_LR=1e-4,
+    AUX_WEIGHT=1.0,
+    EPOCHS=None,
+    LR=None,
+    WEIGHT_DECAY=0.01,
+    LORA_R=8,
+    LORA_ALPHA=16.0,
+    LORA_LR=0.0001,
+    LORA_TARGETS=None,
+    BATCH_SIZE=2,
+    MICRO_BATCH_SIZE=1,
+    GRAD_ACCUM_STEPS=16,
+    EVAL_BATCH_SIZE=1,
+    TRAIN_PRECISION='bf16',
+    MAX_GRAD_NORM=1.0,
+    EVAL_TF32=False,
+    STRICT_DETERMINISM=False,
+    NUM_WORKERS=4,
+    LOADER_BACKEND='thread',
+    FAIL_FAST=True,
+    BENCH_WARMUP=2,
+    BENCH_REPEATS=5,
+    BENCH_TRIALS=1,
+    FLOP_BATCHES=1,
+    PROFILE_REPEATS=1,
+    IMAGENET_ROOT=None,
+    ADE_ROOT=None,
+    SPLIT_ROOT=None,
+    ATTENTION_MODULE_NAMES=None,
+):
     """Run real saved splits, select on dev, evaluate held-out, save baseline-compatible metrics.
 
     One variant per run makes task/model report rows unambiguous. All artifacts
     are under ROOT/report_2/cropr measurements. No cache, downloads, or resume.
     """
     ROOT = cropr_module.resolve_project_root(ROOT)
-    EPOCHS = dict(EPOCHS or {'classification': 2, 'segmentation': 2})
-    LR = dict(LR or {'classification': 1e-3, 'segmentation': 1e-3})
+    EPOCHS = dict({'classification': 1, 'segmentation': 1} if EPOCHS is None else EPOCHS)
+    LR = dict({'classification': 0.001, 'segmentation': 0.001} if LR is None else LR)
     IMAGENET_ROOT = Path(IMAGENET_ROOT) if IMAGENET_ROOT is not None else ROOT / 'datasets/imagenet'
     ADE_ROOT = Path(ADE_ROOT) if ADE_ROOT is not None else ROOT / 'datasets/ade20k/ADEChallengeData2016'
     SPLIT_ROOT = Path(SPLIT_ROOT) if SPLIT_ROOT is not None else ROOT / 'datasets/splits'

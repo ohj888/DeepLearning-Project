@@ -19,8 +19,8 @@ Use load_baseline_checkpoint on the same original pretrained model to reload.
 No automatic resume. Inference measurements and held-out scores use merged LoRA.
 LoRA requires activation memory: a small adapter does not make training as cheap
 as cached head fitting. The runner never silently reduces batch size on OOM.
-448 defaults for an RTX 4060 Laptop with 8 GiB VRAM / 16 GiB RAM:
-LoRA microbatch 1, accumulation 16, eval batch 1, benchmark batch 2.
+448 comparison defaults (verify memory capacity before a full run):
+Local smoke protocol: microbatch 1, accumulation 16, eval batch 1, benchmark batch 2.
 These settings require on-device memory validation; no fit guarantee.
 BATCH_SIZE describes inference; MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS describes training.
 Final partial windows and ignored segmentation pixels use exact valid-target normalization.
@@ -28,7 +28,7 @@ Final partial windows and ignored segmentation pixels use exact valid-target nor
 
 Run the notebook's existing BaselineModel definition first, then call:
     run_baselines(BaselineModel, ROOT=Path.cwd(),
-                  EPOCHS={"classification": 3, "segmentation": 5})
+                  EPOCHS={"classification": 2, "segmentation": 2})
 
 In cached_head mode, train/dev features are built fresh. Train stores both RGB
 orientations; dev stores the original. Cache arrays are float32 disk-backed NPY.
@@ -1348,9 +1348,10 @@ class _Runner:
                         if part != "val" and Path(rel).parent.name not in self.class_to_idx:
                             raise ValueError(f"Unknown training class: {rel}")
             print(task, {p: len(split[f"{p}_files"]) for p in ("train", "dev", "val")})
-        self.out = self.root / "report 1"/ "baseline measurments" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.out = self.root / "report_1" / "baseline measurments" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.out.mkdir(parents=True, exist_ok=False)
         write_json(self.out / "configuration.json", {
+            "model_definition_sha256": hashlib.sha256((Path(__file__).resolve().parents[1] / "baseline_models.py").read_bytes()).hexdigest(),
             "training_mode": c["TRAINING_MODE"],
             "cache_dtype": "float32" if c["TRAINING_MODE"] == "cached_head" else None,
             "lora": {"rank": c["LORA_R"], "alpha": c["LORA_ALPHA"], "lr": c["LORA_LR"],
@@ -1657,7 +1658,10 @@ class _Runner:
         del output, initial, probe
         if _frozen_backbone_digest(model.backbone) != base_hash:
             raise RuntimeError('Pretrained state changed during adapter setup.')
-        write_json(directory / 'lora_setup.json', {**spec, 'pretrained_backbone_sha256': base_hash,
+        write_json(directory / 'lora_setup.json', {**spec,
+                   'initial_state_hash_format': 'tensor_state_v1',
+                   'initial_head_sha256': _state_digest(head.state_dict()),
+                   'initial_lora_sha256': _state_digest(_adapter_state(model.backbone)), 'pretrained_backbone_sha256': base_hash,
                    'initial_output_equivalence': True, 'gradient_connectivity': True,
                    'cache_enabled': False, 'backbone_eval_mode': True})
         initial_adapters = _adapter_state(model.backbone)
@@ -2199,19 +2203,48 @@ class _Runner:
 
 
 def run_baselines(
-    model_factory, *, ROOT=None, SEED=42, SIZE=448,
-    MODEL_NAMES=("dinov2", "siglip2", "radio"), EPOCHS=None,
-    BATCH_SIZE=2, MICRO_BATCH_SIZE=1, GRAD_ACCUM_STEPS=16, EVAL_BATCH_SIZE=1, LR=None, WEIGHT_DECAY=0.01, NUM_WORKERS=0,
-    BENCH_WARMUP=10, BENCH_REPEATS=50, PROFILE_REPEATS=3,
-    IMAGENET_ROOT=None, ADE_ROOT=None, SPLIT_ROOT=None,
-    ATTENTION_MODULE_NAMES=None, FLOP_BATCHES=3, BENCH_TRIALS=3,
-    CACHE_ROOT=None, CACHE_BATCH_SIZE=None, KEEP_CACHE=False,
-    TASKS=("classification", "segmentation"),
-    TRAINING_MODE="lora", LORA_R=8, LORA_ALPHA=16.0, LORA_LR=1e-4,
-    LORA_TARGETS=None, LORA_UNWRAP_BACKBONE_FORWARD=True,
-    MAX_GRAD_NORM=1.0, STRICT_DETERMINISM=False,
-    TRAIN_PRECISION="bf16", LOADER_BACKEND="process", FAIL_FAST=True,
-    COMPILE_LORA=False, COMPILE_BACKEND="inductor", COMPILE_MODE="default", EVAL_TF32=False,
+    model_factory,
+    *,
+    ROOT=None,
+    SEED=42,
+    SIZE=448,
+    MODEL_NAMES=('dinov2', 'siglip2', 'radio'),
+    EPOCHS=None,
+    BATCH_SIZE=2,
+    MICRO_BATCH_SIZE=1,
+    GRAD_ACCUM_STEPS=16,
+    EVAL_BATCH_SIZE=1,
+    LR=None,
+    WEIGHT_DECAY=0.01,
+    NUM_WORKERS=4,
+    BENCH_WARMUP=2,
+    BENCH_REPEATS=5,
+    PROFILE_REPEATS=1,
+    IMAGENET_ROOT=None,
+    ADE_ROOT=None,
+    SPLIT_ROOT=None,
+    ATTENTION_MODULE_NAMES=None,
+    FLOP_BATCHES=1,
+    BENCH_TRIALS=1,
+    CACHE_ROOT=None,
+    CACHE_BATCH_SIZE=None,
+    KEEP_CACHE=False,
+    TASKS=('classification', 'segmentation'),
+    TRAINING_MODE="lora",
+    LORA_R=8,
+    LORA_ALPHA=16.0,
+    LORA_LR=0.0001,
+    LORA_TARGETS=None,
+    LORA_UNWRAP_BACKBONE_FORWARD=True,
+    MAX_GRAD_NORM=1.0,
+    STRICT_DETERMINISM=False,
+    TRAIN_PRECISION='bf16',
+    LOADER_BACKEND='thread',
+    FAIL_FAST=True,
+    COMPILE_LORA=False,
+    COMPILE_BACKEND="inductor",
+    COMPILE_MODE="default",
+    EVAL_TF32=False,
 ):
     """Run selected TASKS and MODEL_NAMES; return (results, OUT).
 
@@ -2219,9 +2252,9 @@ def run_baselines(
     only in the parent process.  When called from a .py script (not a notebook),
     put the call under `if __name__ == "__main__":`.
     """
-    ROOT = Path.cwd() if ROOT is None else Path(ROOT).expanduser().resolve()
-    EPOCHS = dict(EPOCHS) if EPOCHS is not None else {"classification": 3, "segmentation": 5}
-    LR = dict(LR) if LR is not None else {"classification": 1e-3, "segmentation": 1e-3}
+    ROOT = Path(__file__).resolve().parents[1] if ROOT is None else Path(ROOT).expanduser().resolve()
+    EPOCHS = dict(EPOCHS) if EPOCHS is not None else dict({'classification': 1, 'segmentation': 1})
+    LR = dict(LR) if LR is not None else dict({'classification': 0.001, 'segmentation': 0.001})
     IMAGENET_ROOT = Path(IMAGENET_ROOT) if IMAGENET_ROOT is not None else ROOT / "datasets/imagenet"
     ADE_ROOT = Path(ADE_ROOT) if ADE_ROOT is not None else ROOT / "datasets/ade20k/ADEChallengeData2016"
     SPLIT_ROOT = Path(SPLIT_ROOT) if SPLIT_ROOT is not None else ROOT / "datasets/splits"
@@ -2305,7 +2338,7 @@ def add_forward_flops_to_run(model_factory, run_dir, *, ROOT=None,
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable.  Select your CUDA PyTorch notebook kernel.')
     run_dir = Path(run_dir).expanduser().resolve()
-    root = Path.cwd() if ROOT is None else Path(ROOT).expanduser().resolve()
+    root = Path(__file__).resolve().parents[1] if ROOT is None else Path(ROOT).expanduser().resolve()
     config = json.loads((run_dir / 'configuration.json').read_text(encoding='utf-8'))
     roots = {
         'classification': Path(IMAGENET_ROOT) if IMAGENET_ROOT is not None else root / 'datasets/imagenet',
@@ -2426,7 +2459,7 @@ def refresh_component_timings(model_factory, run_dir, *, ROOT=None,
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
     run_dir = Path(run_dir).expanduser().resolve()
-    root = Path.cwd() if ROOT is None else Path(ROOT).expanduser().resolve()
+    root = Path(__file__).resolve().parents[1] if ROOT is None else Path(ROOT).expanduser().resolve()
     config = json.loads((run_dir / "configuration.json").read_text(encoding="utf-8"))
     csv_path = run_dir / "baseline measurments.csv"
     with csv_path.open(newline="", encoding="utf-8") as f:

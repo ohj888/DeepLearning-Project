@@ -146,6 +146,26 @@ def write_json(path, obj):
     os.replace(temporary, path)
 
 
+def prepare_model_output_dirs(measurements_root, model_names):
+    """Create stable per-model outputs and archive the previous latest run."""
+    measurements_root = Path(measurements_root)
+    measurements_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    outputs = {}
+    for name in dict.fromkeys(model_names):
+        model_root = measurements_root / name
+        latest = model_root / "latest"
+        if latest.is_dir() and any(latest.iterdir()):
+            archive_root = model_root / "old measurements"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            archive = archive_root / stamp
+            shutil.copytree(latest, archive)
+            shutil.rmtree(latest)
+        latest.mkdir(parents=True, exist_ok=True)
+        outputs[name] = latest
+    return outputs
+
+
 def atomic_torch_save(obj, path):
     path = Path(path)
     temporary = path.with_name(path.name + ".tmp")
@@ -897,8 +917,8 @@ class _Runner:
                         if part != "val" and Path(rel).parent.name not in self.class_to_idx:
                             raise ValueError(f"Unknown training class: {rel}")
             print(task, {p: len(split[f"{p}_files"]) for p in ("train", "dev", "val")})
-        self.out = self.root / "report_2" / "cropr measurements" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.out.mkdir(parents=True, exist_ok=False)
+        self.out = self.root / "report_2" / "cropr measurements"
+        self.model_outputs = prepare_model_output_dirs(self.out, c["MODEL_NAMES"])
         configuration = {
             "model_definition_sha256": hashlib.sha256((Path(__file__).resolve().parents[1] / "baseline_models.py").read_bytes()).hexdigest(),
             "training_mode": "cropr", "seed": c["SEED"], "input_size": c["SIZE"],
@@ -938,7 +958,9 @@ class _Runner:
             "flops_counter_version": 3, "attention_module_names": c["ATTENTION_MODULE_NAMES"],
         }
         write_json(self.out / "configuration.json", configuration)
-        print("Results:", self.out)
+        for latest in self.model_outputs.values():
+            write_json(latest / "configuration.json", configuration)
+        print("Results:", self.out / "<model>" / "latest")
         print("Cropr variant:", c["VARIANT"], "| precision:", c["TRAIN_PRECISION"])
 
 
@@ -1118,22 +1140,29 @@ class _Runner:
                     result = self.run_experiment(name, task)
                 except Exception as exc:
                     result = {"model": name, "task": task, "status": "failed", "error": str(exc)}
-                    (self.out / f"{task}_{name}_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+                    error_path = self.model_outputs[name] / f"{task}_error.txt"
+                    error_path.write_text(traceback.format_exc(), encoding="utf-8")
                     if isinstance(exc, torch.cuda.OutOfMemoryError):
                         print("CUDA OOM: reduce MICRO_BATCH_SIZE for training, EVAL_BATCH_SIZE for evaluation, "
                               "or BATCH_SIZE for FP32 benchmarks.  GRAD_ACCUM_STEPS preserves the desired "
                               "effective training batch.  No automatic retry or batch change was performed.")
                     print("FAILED:", exc)
-                    print("Full traceback:", self.out / f"{task}_{name}_error.txt")
+                    print("Full traceback:", error_path)
                     if self.c.get("FAIL_FAST", True):
+                        model_results = [r for r in results + [result] if r["model"] == name]
+                        write_csv(self.model_outputs[name] / "cropr measurements.csv", model_results)
                         write_csv(self.out / "cropr measurements.csv", results + [result])
                         raise
                 results.append(result)
+                model_results = [r for r in results if r["model"] == name]
+                write_csv(self.model_outputs[name] / "cropr measurements.csv", model_results)
                 write_csv(self.out / "cropr measurements.csv", results)
                 gc.collect()
                 torch.cuda.empty_cache()
         print("\nFinished.  Measurements saved to:")
         print(self.out / "cropr measurements.csv")
+        for name in self.c["MODEL_NAMES"]:
+            print(self.model_outputs[name] / "cropr measurements.csv")
         for result in results:
             print(result["task"], result["model"], "→", result["status"])
         return results, self.out
@@ -1227,7 +1256,7 @@ class _CroprRunner(_Runner):
         seed_everything(c['SEED'])
         gc.collect()
         torch.cuda.empty_cache()
-        directory = self.out / f'{task}_{name}'
+        directory = self.model_outputs[name] / task
         directory.mkdir()
         loaders = {p: self.make_loader(task, p) for p in ('train', 'dev', 'val')}
         if len(loaders['dev'].dataset) < c['BATCH_SIZE']:

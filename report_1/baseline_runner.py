@@ -220,6 +220,26 @@ def write_json(path, obj):
     os.replace(temporary, path)
 
 
+def prepare_model_output_dirs(measurements_root, model_names):
+    """Create stable per-model outputs and archive the previous latest run."""
+    measurements_root = Path(measurements_root)
+    measurements_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    outputs = {}
+    for name in dict.fromkeys(model_names):
+        model_root = measurements_root / name
+        latest = model_root / "latest"
+        if latest.is_dir() and any(latest.iterdir()):
+            archive_root = model_root / "old measurements"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            archive = archive_root / stamp
+            shutil.copytree(latest, archive)
+            shutil.rmtree(latest)
+        latest.mkdir(parents=True, exist_ok=True)
+        outputs[name] = latest
+    return outputs
+
+
 def atomic_torch_save(obj, path):
     path = Path(path)
     temporary = path.with_name(path.name + ".tmp")
@@ -1348,9 +1368,10 @@ class _Runner:
                         if part != "val" and Path(rel).parent.name not in self.class_to_idx:
                             raise ValueError(f"Unknown training class: {rel}")
             print(task, {p: len(split[f"{p}_files"]) for p in ("train", "dev", "val")})
-        self.out = self.root / "report_1" / "baseline measurments" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.out.mkdir(parents=True, exist_ok=False)
-        write_json(self.out / "configuration.json", {
+        self.out = self.root / "report_1" / "baseline measurments"
+        self.model_outputs = prepare_model_output_dirs(self.out, c["MODEL_NAMES"])
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        configuration = {
             "model_definition_sha256": hashlib.sha256((Path(__file__).resolve().parents[1] / "baseline_models.py").read_bytes()).hexdigest(),
             "training_mode": c["TRAINING_MODE"],
             "cache_dtype": "float32" if c["TRAINING_MODE"] == "cached_head" else None,
@@ -1407,9 +1428,12 @@ class _Runner:
             "tasks": c["TASKS"], "cache_validation_version": 2,
             "attention_module_names": c["ATTENTION_MODULE_NAMES"],
             "attention_flops_convention": "dense_matmul_2_flops_per_mac",
-        })
+        }
+        write_json(self.out / "configuration.json", configuration)
+        for latest in self.model_outputs.values():
+            write_json(latest / "configuration.json", configuration)
         print("\nGPU:", torch.cuda.get_device_name(self.device))
-        print("Results:", self.out)
+        print("Results:", self.out / "<model>" / "latest")
         print("Training precision:", c["TRAIN_PRECISION"], "| evaluation TF32:", c.get("EVAL_TF32", False),
               "| benchmarks: fp32, TF32 disabled")
         print("Image loader:", c["LOADER_BACKEND"], "| workers:", c["NUM_WORKERS"])
@@ -1597,7 +1621,7 @@ class _Runner:
         seed_everything(c['SEED'])
         gc.collect()
         torch.cuda.empty_cache()
-        directory = self.out / f'{task}_{name}'
+        directory = self.model_outputs[name] / task
         directory.mkdir()
         loaders = {p: self.make_loader(task, p) for p in ('train', 'dev', 'val')}
         with loader_timer("Checking image loader before model allocation"), first_batch_progress(loaders['dev']) as (progress, per_image):
@@ -1906,7 +1930,7 @@ class _Runner:
         seed_everything(c["SEED"])
         gc.collect()
         torch.cuda.empty_cache()
-        directory = self.out / f"{task}_{name}"
+        directory = self.model_outputs[name] / task
         directory.mkdir()
         loaders = {p: self.make_loader(task, p) for p in ("train", "dev", "val")}
         model = self.model_factory(name)
@@ -1947,7 +1971,7 @@ class _Runner:
                     write_json(directory / "cache_validation.json", cache_validation)
             del x, patches, features
         raw_dev_dataset = loaders["dev"].dataset
-        cache_dir = c["CACHE_ROOT"] / self.out.name / f"{task}_{name}"
+        cache_dir = c["CACHE_ROOT"] / self.run_id / f"{task}_{name}"
         cache_dir.mkdir(parents=True, exist_ok=False)
         cache_stats = {}
         for part in ("train", "dev"):
@@ -2181,22 +2205,29 @@ class _Runner:
                     result = self.run_experiment(name, task)
                 except Exception as exc:
                     result = {"model": name, "task": task, "status": "failed", "error": str(exc)}
-                    (self.out / f"{task}_{name}_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+                    error_path = self.model_outputs[name] / f"{task}_error.txt"
+                    error_path.write_text(traceback.format_exc(), encoding="utf-8")
                     if isinstance(exc, torch.cuda.OutOfMemoryError):
                         print("CUDA OOM: reduce MICRO_BATCH_SIZE for training, EVAL_BATCH_SIZE for evaluation, "
                               "or BATCH_SIZE for FP32 benchmarks.  GRAD_ACCUM_STEPS preserves the desired "
                               "effective training batch.  No automatic retry or batch change was performed.")
                     print("FAILED:", exc)
-                    print("Full traceback:", self.out / f"{task}_{name}_error.txt")
+                    print("Full traceback:", error_path)
                     if self.c.get("FAIL_FAST", True):
+                        model_results = [r for r in results + [result] if r["model"] == name]
+                        write_csv(self.model_outputs[name] / "baseline measurements.csv", model_results)
                         write_csv(self.out / "baseline measurments.csv", results + [result])
                         raise
                 results.append(result)
+                model_results = [r for r in results if r["model"] == name]
+                write_csv(self.model_outputs[name] / "baseline measurements.csv", model_results)
                 write_csv(self.out / "baseline measurments.csv", results)
                 gc.collect()
                 torch.cuda.empty_cache()
         print("\nFinished.  Measurements saved to:")
         print(self.out / "baseline measurments.csv")
+        for name in self.c["MODEL_NAMES"]:
+            print(self.model_outputs[name] / "baseline measurements.csv")
         for result in results:
             print(result["task"], result["model"], "→", result["status"])
         return results, self.out
@@ -2347,7 +2378,9 @@ def add_forward_flops_to_run(model_factory, run_dir, *, ROOT=None,
     split_root = Path(SPLIT_ROOT) if SPLIT_ROOT is not None else root / 'datasets/splits'
     size, batch_size = config['input_size'], config['batch_size']
     names_by_model = (config.get('attention_module_names') or {}) if ATTENTION_MODULE_NAMES is None else ATTENTION_MODULE_NAMES
-    csv_path = run_dir / 'baseline measurments.csv'
+    csv_path = run_dir / 'baseline measurements.csv'
+    if not csv_path.is_file():  # Backward compatibility with timestamped runs.
+        csv_path = run_dir / 'baseline measurments.csv'
     with open(csv_path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
     os.environ['HF_HUB_OFFLINE'] = '1'
@@ -2360,7 +2393,9 @@ def add_forward_flops_to_run(model_factory, run_dir, *, ROOT=None,
         if row.get('status') != 'completed':
             continue
         name, task = row['model'], row['task']
-        directory = run_dir / f'{task}_{name}'
+        directory = run_dir / task
+        if not directory.is_dir():  # Backward compatibility with timestamped runs.
+            directory = run_dir / f'{task}_{name}'
         result_path = directory / 'result.json'
         # Read canonical numeric results rather than round-tripping them through CSV strings.
         result = json.loads(result_path.read_text(encoding='utf-8'))
@@ -2461,7 +2496,9 @@ def refresh_component_timings(model_factory, run_dir, *, ROOT=None,
     run_dir = Path(run_dir).expanduser().resolve()
     root = Path(__file__).resolve().parents[1] if ROOT is None else Path(ROOT).expanduser().resolve()
     config = json.loads((run_dir / "configuration.json").read_text(encoding="utf-8"))
-    csv_path = run_dir / "baseline measurments.csv"
+    csv_path = run_dir / "baseline measurements.csv"
+    if not csv_path.is_file():  # Backward compatibility with timestamped runs.
+        csv_path = run_dir / "baseline measurments.csv"
     with csv_path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     selected = [r for r in rows if r.get("status") == "completed"
@@ -2480,7 +2517,9 @@ def refresh_component_timings(model_factory, run_dir, *, ROOT=None,
     size, batch = config["input_size"], config["batch_size"]
     for row in selected:
         name, task = row["model"], row["task"]
-        directory = run_dir / f"{task}_{name}"
+        directory = run_dir / task
+        if not directory.is_dir():  # Backward compatibility with timestamped runs.
+            directory = run_dir / f"{task}_{name}"
         split_path = root / "datasets/splits" / ("imagenet_split.json" if task == "classification" else "ade20k_split.json")
         expected = config.get("split_sha256", {}).get(task)
         if expected and hashlib.sha256(split_path.read_bytes()).hexdigest() != expected:

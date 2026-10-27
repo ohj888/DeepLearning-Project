@@ -837,6 +837,160 @@ def _component_time_summary(prof, matched):
     }
 
 
+def refresh_component_timings(run_root, *, ROOT=None,
+                              MODEL_NAMES=("radio",),
+                              TASKS=("classification", "segmentation"),
+                              PROFILE_REPEATS=10, WARMUP=10):
+    """Refresh Cropr inference component timings from saved checkpoints, no training."""
+    if type(PROFILE_REPEATS) is not int or PROFILE_REPEATS < 1:
+        raise ValueError("PROFILE_REPEATS must be a positive integer.")
+    if type(WARMUP) is not int or WARMUP < 0:
+        raise ValueError("WARMUP must be a nonnegative integer.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required. Select the CUDA notebook kernel.")
+    model_names, tasks = tuple(MODEL_NAMES), tuple(TASKS)
+    if not model_names or len(set(model_names)) != len(model_names):
+        raise ValueError("MODEL_NAMES must be nonempty with no duplicates.")
+    if any(name not in {"dinov2", "siglip2", "radio"} for name in model_names):
+        raise ValueError("Choose model names from dinov2, siglip2, radio.")
+    if not tasks or len(set(tasks)) != len(tasks):
+        raise ValueError("TASKS must be nonempty with no duplicates.")
+    if any(task not in {"classification", "segmentation"} for task in tasks):
+        raise ValueError("TASKS must contain classification and/or segmentation.")
+
+    run_root = Path(run_root).expanduser().resolve()
+    root = Path(__file__).resolve().parents[1] if ROOT is None else Path(ROOT).expanduser().resolve()
+    aggregate_csv = run_root / "cropr measurements.csv"
+    if not aggregate_csv.is_file():
+        raise FileNotFoundError(f"Cropr aggregate measurements not found: {aggregate_csv}")
+    with aggregate_csv.open(newline="", encoding="utf-8") as f:
+        aggregate_rows = list(csv.DictReader(f))
+
+    jobs = []
+    for name in model_names:
+        model_root = run_root / name / "latest"
+        config_path = model_root / "configuration.json"
+        model_csv = model_root / "cropr measurements.csv"
+        if not config_path.is_file() or not model_csv.is_file():
+            raise FileNotFoundError(f"Missing latest Cropr configuration or CSV for {name}: {model_root}")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("training_mode") != "cropr":
+            raise ValueError(f"{model_root} is not a Cropr run.")
+        with model_csv.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        for task in tasks:
+            task_rows = [row for row in rows
+                         if row.get("model") == name and row.get("task") == task
+                         and row.get("status") == "completed"]
+            if len(task_rows) != 1:
+                raise ValueError(f"Expected one completed {name}/{task} row in {model_csv}.")
+            aggregate_matches = [row for row in aggregate_rows
+                                 if row.get("model") == name and row.get("task") == task]
+            if len(aggregate_matches) > 1:
+                raise ValueError(f"Duplicate {name}/{task} rows found in {aggregate_csv}.")
+            directory = model_root / task
+            checkpoint = directory / "best_cropr.pt"
+            if not checkpoint.is_file():
+                raise FileNotFoundError(f"Cropr checkpoint not found: {checkpoint}")
+            jobs.append((name, task, model_root, config, rows, directory, checkpoint))
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_root = run_root / "component timing backups" / stamp
+    backup_root.mkdir(parents=True)
+    for name, task, model_root, _, _, directory, _ in jobs:
+        for path in (aggregate_csv, model_root / "cropr measurements.csv",
+                     directory / "result.json", directory / "profiling.json",
+                     directory / "inference_trace.json"):
+            if path.is_file():
+                destination = backup_root / path.relative_to(run_root)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, destination)
+
+    split_root = root / "datasets" / "splits"
+    data_roots = {
+        "classification": root / "datasets" / "imagenet",
+        "segmentation": root / "datasets" / "ade20k" / "ADEChallengeData2016",
+    }
+    pending_updates = []
+    torch.cuda.set_device(0)
+    with evaluation_tf32(False):
+        for name, task, model_root, config, rows, directory, checkpoint in jobs:
+            split_path = split_root / (
+                "imagenet_split.json" if task == "classification" else "ade20k_split.json"
+            )
+            expected_hash = config.get("split_sha256", {}).get(task)
+            if expected_hash and hashlib.sha256(split_path.read_bytes()).hexdigest() != expected_hash:
+                raise ValueError(f"Saved split has changed since training: {split_path}")
+            split = json.loads(split_path.read_text(encoding="utf-8"))
+            dataset = SavedSplitDataset(
+                task, "dev", split["dev_files"], data_roots[task],
+                config["input_size"], split.get("class_to_idx", {}), {},
+            )
+            batch_size = config["batch_size"]
+            if len(dataset) < batch_size:
+                raise ValueError(f"Dev split is smaller than the recorded batch size: {task}")
+
+            model = images = None
+            try:
+                model = cropr_module.load_cropr_checkpoint(
+                    checkpoint, root=root, device="cuda:0", merge=True
+                )
+                images = torch.stack([dataset[i][0] for i in range(batch_size)]).to("cuda:0")
+                with torch.no_grad():
+                    for _ in range(WARMUP):
+                        model(images, task)
+                    torch.cuda.synchronize()
+                    with component_labels(model, task) as matched:
+                        with profile(
+                            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                        ) as prof:
+                            for _ in range(PROFILE_REPEATS):
+                                with record_function("component/total"):
+                                    model(images, task)
+                            torch.cuda.synchronize()
+                summary = _component_time_summary(prof, matched)
+                summary.update(
+                    component_profile_repeats=PROFILE_REPEATS,
+                    component_profile_batch_size=batch_size,
+                )
+
+                pending_updates.append((name, task, model_root, rows, directory,
+                                        summary, matched))
+                print(name, task, "available:", summary["component_gpu_attribution_available"],
+                      "reason:", summary["component_gpu_attribution_reason"])
+            finally:
+                del model, images
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    results = []
+    for name, task, model_root, rows, directory, summary, matched in pending_updates:
+        profiling_path = directory / "profiling.json"
+        profiling = json.loads(profiling_path.read_text(encoding="utf-8"))
+        profiling.update(summary, matched_modules=matched)
+        write_json(profiling_path, profiling)
+
+        result_path = directory / "result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result.update(summary)
+        write_json(result_path, result)
+
+        for row in rows:
+            if row.get("model") == name and row.get("task") == task:
+                row.update(summary)
+        aggregate_matches = [row for row in aggregate_rows
+                             if row.get("model") == name and row.get("task") == task]
+        if aggregate_matches:
+            aggregate_matches[0].update(summary)
+        else:
+            aggregate_rows.append({**result, **summary})
+        write_csv(model_root / "cropr measurements.csv", rows)
+        write_csv(aggregate_csv, aggregate_rows)
+        results.append(result)
+    print("Previous profiling outputs backed up to:", backup_root)
+    return results, run_root
+
+
 class _Runner:
 
 
